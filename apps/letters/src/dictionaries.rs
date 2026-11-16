@@ -2,14 +2,17 @@
 //!
 //! A dictionary is an `.aff` file and a `.dic` file of one name, such as `de_DE` or `pt_BR`. They are large
 //! and slow to read, so only those a document names are looked for, away from the thread that paints. A
-//! language the system has no dictionary for is simply left unchecked.
+//! language the system has no dictionary for is asked of the server a document is kept at, if it is kept
+//! at one, and else simply left unchecked.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
 use letters_model::Document;
 use letters_spell::{Dictionary, best_dictionary, dictionary_language};
+
+use crate::session::Session;
 
 /// A file larger than this is not read: no word list is worth that much memory.
 const LARGEST: u64 = 64 << 20;
@@ -116,6 +119,33 @@ pub fn load(folders: &[PathBuf], language: &str) -> Option<(String, Dictionary)>
             None
         }
     }
+}
+
+/// The dictionaries among `held`, a server's by their tags, that text in `languages` is checked against:
+/// each by the server's tag for it, with the tag a speller takes it under. The one a region the server has
+/// none for falls back to goes under the language alone, where a speller looks for such a region's, so
+/// that the speller and the server choose alike. The browser asks by the same rule.
+pub fn served(languages: &BTreeSet<String>, held: &[String]) -> BTreeMap<String, String> {
+    let best = |tag: &str| best_dictionary(held.iter().map(String::as_str), tag);
+    let mut wanted = BTreeMap::new();
+    for tag in languages {
+        let Some(at) = best(tag) else { continue };
+        let language = tag.split('-').next().unwrap_or(tag);
+        let under = if best(language) == Some(at) { language.to_owned() } else { held[at].clone() };
+        wanted.insert(held[at].clone(), under);
+    }
+    wanted
+}
+
+/// Reads the dictionary a server has for the language `tag`, one of those it lists. `None` when it
+/// cannot be had or used: the language is then not checked, which is no error to show anyone. This waits
+/// on the network.
+pub fn fetch(session: &Session, tag: &str) -> Option<Dictionary> {
+    let parsed = session
+        .dictionary(tag, LARGEST)
+        .map_err(|refused| refused.to_string())
+        .and_then(|(aff, dic)| Dictionary::parse(&aff, &dic).map_err(|error| error.to_string()));
+    parsed.inspect_err(|error| eprintln!("letters: the server's dictionary for {tag} cannot be used: {error}")).ok()
 }
 
 fn read(path: &Path) -> io::Result<Vec<u8>> {

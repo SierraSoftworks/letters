@@ -235,6 +235,22 @@ impl Session {
         self.ask(|server, token| server.done(token, &paths::put_back(space, file)))
     }
 
+    /// The languages the server has a spelling dictionary for, as tags such as `de-DE`. English is not
+    /// among them.
+    pub fn dictionaries(&self) -> Result<Vec<String>, Refused> {
+        self.ask(|server, token| server.get(token, paths::DICTIONARIES))
+    }
+
+    /// The dictionary the server has that best serves the language `tag`, as the text of its two files:
+    /// its affixes, then its words. Each is `most` bytes at most. The server sends both as UTF-8.
+    pub fn dictionary(&self, tag: &str, most: u64) -> Result<(String, String), Refused> {
+        let text = |path: String| {
+            let file = self.ask(|server, token| server.fetch(token, &path, most))?;
+            Ok(String::from_utf8_lossy(&file).into_owned())
+        };
+        Ok((text(paths::dictionary_aff(tag))?, text(paths::dictionary_dic(tag))?))
+    }
+
     /// Who a document is shared with, besides those its space lets in.
     pub fn shares(&self, id: &str) -> Result<Shares, Refused> {
         self.ask(|server, token| server.get(token, &paths::shares(id)))

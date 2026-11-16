@@ -1,9 +1,10 @@
 //! Finding and reading the system's dictionaries for the languages a document names.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
-use letters::dictionaries::{find, installed, languages, load};
+use letters::dictionaries::{find, installed, languages, load, served};
 use letters_model::{Block, BlockKind, Body, Document, Run};
 
 /// Folders of dictionaries for one test, removed when the test ends.
@@ -93,6 +94,28 @@ fn the_dictionary_nearest_to_a_language_is_found() {
         let found = find(&folders, language);
         let expected = expected.map(|(folder, name)| shelves.0.join(folder).join(format!("{name}.aff")));
         assert_eq!(found.map(|found| found.aff), expected, "{language}: {why}");
+    }
+}
+
+#[test]
+fn a_servers_dictionary_is_taken_under_the_tag_the_speller_looks_for() {
+    /// The languages a document names, what the server has, and each dictionary to fetch with the tag it
+    /// is added under.
+    type Case = (&'static [&'static str], &'static [&'static str], &'static [(&'static str, &'static str)]);
+    let cases: [Case; 5] = [
+        // A region the server lacks falls back to the language's dictionary, fetched once for both.
+        (&["de", "de-CH"], &["de-DE"], &[("de-DE", "de")]),
+        (&["de-CH"], &["de-DE", "de-CH"], &[("de-CH", "de-CH")]),
+        (&["de", "de-CH"], &["de-DE", "de-CH"], &[("de-CH", "de-CH"), ("de-DE", "de")]),
+        (&["pt-BR"], &["pt-PT", "pt-BR"], &[("pt-BR", "pt-BR")]),
+        (&["fr"], &["de-DE"], &[]),
+    ];
+    for (named, held, expected) in cases {
+        let named: BTreeSet<String> = named.iter().map(|tag| (*tag).to_owned()).collect();
+        let held: Vec<String> = held.iter().map(|tag| (*tag).to_owned()).collect();
+        let expected: BTreeMap<String, String> =
+            expected.iter().map(|(tag, under)| ((*tag).to_owned(), (*under).to_owned())).collect();
+        assert_eq!(served(&named, &held), expected, "{named:?} of {held:?}");
     }
 }
 

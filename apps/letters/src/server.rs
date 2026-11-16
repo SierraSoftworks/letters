@@ -181,6 +181,11 @@ impl Client {
         self.call(Verb::Get, &paths::asset(id, name), Some(token), None, CARRYING, most)
     }
 
+    /// What the server has at `path`, as it is and of `most` bytes at most: a file of a dictionary, say.
+    pub fn fetch(&self, token: &str, path: &str, most: u64) -> Result<Vec<u8>, Refused> {
+        self.call(Verb::Get, path, Some(token), None, CARRYING, most)
+    }
+
     /// Hands the server a picture of a document, before the edit that names it is sent.
     pub fn keep_asset(&self, token: &str, id: &str, name: &str, bytes: &[u8]) -> Result<(), Refused> {
         let kind = crate::pictures::mime(bytes).unwrap_or("application/octet-stream");

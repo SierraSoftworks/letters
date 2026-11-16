@@ -148,6 +148,11 @@ pub enum Event {
     Previewed(WindowId, String, Result<Box<LinkPreviewFound>, String>),
     /// A system dictionary a window's document asked for has been read, under the name it has on disk.
     Dictionary(WindowId, String, Box<Dictionary>),
+    /// The server of a window's document said which languages it has dictionaries for.
+    Served(WindowId, Vec<String>),
+    /// These languages a window's document names were not looked for after all, since the server could
+    /// not be asked. They are asked about again.
+    Unasked(WindowId, Vec<String>),
     /// The way to a server's document was opened for the window that asked: the session at its server
     /// and the document's copy on this device, or why there is neither.
     /// There is nothing to say of a sign-in the person gave up.
@@ -690,8 +695,10 @@ struct DocWindow {
     id: Option<String>,
     /// Whether the view was told that formulas may link, which a trusted document's may.
     maths_links: bool,
-    /// The languages a system dictionary has been looked for, each once whether or not there was one.
+    /// The languages a dictionary has been looked for, each once whether or not there was one.
     asked: BTreeSet<String>,
+    /// The languages the document's server has dictionaries for, once it has said.
+    served: Option<Vec<String>>,
     /// The view's edit count that is safely on disk.
     saved_edits: u64,
     /// The edit count a save was last planned for.
@@ -1276,19 +1283,52 @@ impl DocWindow {
     }
 
     /// Looks for the system's dictionaries for the languages the document names and has not asked about
-    /// yet, on another thread. One that is found arrives as an event. One that is not is no one's concern.
+    /// yet, on another thread. One that is found arrives as an event. A language the system has none for
+    /// is asked of the document's server, if it has one, which is first asked what it has: the Language
+    /// dialog offers those too. One that nobody has is no one's concern.
     fn ask_dictionaries(&mut self, proxy: &EventLoopProxy<Event>, folders: &Arc<[PathBuf]>) {
         let mut wanted = dictionaries::languages(self.view.editor().doc());
         wanted.retain(|language| self.asked.insert(language.clone()));
-        if wanted.is_empty() {
+        let session = self.remote.as_ref().map(|remote| remote.line.session().clone());
+        let held = self.served.clone();
+        if wanted.is_empty() && (session.is_none() || held.is_some()) {
             return;
         }
         let (id, proxy, folders) = (self.window.id(), proxy.clone(), folders.clone());
         thread::spawn(move || {
-            for (name, dictionary) in wanted.iter().filter_map(|language| dictionaries::load(&folders, language)) {
-                let _ = proxy.send_event(Event::Dictionary(id, name, Box::new(dictionary)));
+            let mut lacking = BTreeSet::new();
+            for language in wanted {
+                match dictionaries::load(&folders, &language) {
+                    Some((name, dictionary)) => {
+                        let _ = proxy.send_event(Event::Dictionary(id, name, Box::new(dictionary)));
+                    }
+                    None => _ = lacking.insert(language),
+                }
+            }
+            let Some(session) = session else { return };
+            let held = match (held, session.dictionaries()) {
+                (Some(held), _) => held,
+                (None, Ok(held)) => {
+                    let _ = proxy.send_event(Event::Served(id, held.clone()));
+                    held
+                }
+                // A server that is out of reach is asked again when the document is next saved.
+                (None, Err(_)) => return drop(proxy.send_event(Event::Unasked(id, lacking.into_iter().collect()))),
+            };
+            for (tag, under) in dictionaries::served(&lacking, &held) {
+                if let Some(dictionary) = dictionaries::fetch(&session, &tag) {
+                    let _ = proxy.send_event(Event::Dictionary(id, under, Box::new(dictionary)));
+                }
             }
         });
+    }
+
+    /// Names the languages there are dictionaries for, for the Language dialog and the settings to offer:
+    /// the `system`'s, and those of the document's server.
+    fn tell_languages(&mut self, system: &[String]) {
+        let served = self.served.iter().flatten();
+        let languages: BTreeSet<&String> = system.iter().chain(served).collect();
+        self.view.set_languages(languages);
     }
 
     /// Reads the person's own words again, if their dictionary changed since this window last looked.
@@ -2306,6 +2346,7 @@ impl App {
             id: None,
             maths_links: false,
             asked: BTreeSet::new(),
+            served: None,
             saved_edits: 0,
             noticed_edits: 0,
             save_at: None,
@@ -4293,7 +4334,18 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Languages(languages) => {
                 self.languages = languages;
-                self.windows.values_mut().for_each(|window| window.view.set_languages(&self.languages));
+                self.windows.values_mut().for_each(|window| window.tell_languages(&self.languages));
+            }
+            Event::Served(id, held) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.served = Some(held);
+                    window.tell_languages(&self.languages);
+                }
+            }
+            Event::Unasked(id, languages) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    languages.iter().for_each(|language| _ = window.asked.remove(language));
+                }
             }
             Event::Buttons(buttons) => {
                 self.buttons = buttons;

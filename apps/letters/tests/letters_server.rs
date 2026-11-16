@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use common::{Scratch, Writer};
 use letters::connected::{self, Line, Placing, Said, Told};
+use letters::dictionaries;
 use letters::files::{self, Home};
 use letters::import::Plan;
 use letters::keychain::Keychain;
@@ -819,6 +820,29 @@ fn a_file_brought_in_on_this_device_is_made_a_document_at_the_server_with_its_pi
     assert!(matches!(bring("nobodys"), Err(connected::Unreached::Refused(_))));
     let listed = ours.entries(&space.id, "").expect("the space is listed").entries;
     assert_eq!(listed.iter().filter(|entry| entry.name.starts_with("Rates")).count(), 2);
+}
+
+#[test]
+fn a_language_the_system_has_no_dictionary_for_is_checked_against_the_servers() {
+    let server = Server::start("dictionaries");
+    let session = server.session(ada());
+    assert_eq!(session.dictionaries(), Ok(Vec::new()), "a server with none says so");
+
+    // In Latin-1, as older dictionaries are: the server sends text any device reads.
+    let folder = server._scratch.0.join("state/dictionaries");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("de_DE.aff"), b"SET ISO8859-1\n").unwrap();
+    std::fs::write(folder.join("de_DE.dic"), b"2\nStra\xdfe\ngr\xfcn\n").unwrap();
+    let held = session.dictionaries().expect("the server lists what it has");
+    assert_eq!(held, ["de-DE"]);
+
+    // Swiss German is checked against it, as the server has none nearer.
+    let named = ["de-CH".to_owned()].into();
+    let wanted = dictionaries::served(&named, &held);
+    assert_eq!(wanted.get("de-DE").map(String::as_str), Some("de"));
+    let dictionary = dictionaries::fetch(&session, "de-DE").expect("the dictionary is read");
+    assert!(dictionary.check("Stra\u{df}e") && !dictionary.check("zzyzx"));
+    assert!(dictionaries::fetch(&session, "fr").is_none(), "a language the server has none for is left alone");
 }
 
 // A debug build takes two minutes to merge this much, and three sides here do.
