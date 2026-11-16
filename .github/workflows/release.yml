@@ -1,42 +1,90 @@
 name: Release
 
-# A tag `vX.Y.Z` is a release: every crate is given that version, the desktop app is built for each system,
-# and all of it is published at once as the tag's GitHub release, with the server's image beside it.
+# Releases are cut by running this workflow by hand and choosing which part of the version to raise. It
+# names the next version after the latest release, tags this commit, builds the desktop app for each system
+# and the server at that version, and publishes all of it at once: the files go to a draft that is only
+# published once every one is attached, so this works with immutable releases too.
 # The app looks for its updates there (apps/letters/src/update.rs), by the names given here:
 # `letters-<target>` is the program for one system, which a running Letters replaces itself with.
 #
-# A run by hand, or for a pull request that changes what a release is built with, builds everything and
-# publishes nothing.
+# A pull request that changes what a release is built with builds everything and publishes nothing.
 on:
-  push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to increment
+        type: choice
+        options: [patch, minor, major]
+        default: patch
   pull_request:
     paths:
       - .github/workflows/release.yml
+      - .github/release-notes.md
       - scripts/bundle-macos.sh
       - scripts/set-version.sh
       - apps/letters/macos/**
-  workflow_dispatch:
 
 permissions:
   contents: read
 
+# One release at a time, and none is cut off half way.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'pull_request' && github.ref || 'cut' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   # The oldest macOS the app is built for, which its Info.plist names too.
   MACOSX_DEPLOYMENT_TARGET: "11.0"
-  # The tag's version. Anything else is built as the version the repository has.
-  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
 jobs:
+  # The release's tag. A pull request has none, and builds the version the repository has.
+  version:
+    name: Start release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The first release counts from v0.0.0: `minor` makes it v0.1.0.
+      - name: Name the release
+        id: tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || echo v0.0.0)
+          IFS=. read -r major minor patch <<<"${latest#v}"
+          case "$BUMP" in
+            major) major=$((major + 1)) minor=0 patch=0 ;;
+            minor) minor=$((minor + 1)) patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          tag="v$major.$minor.$patch"
+          echo "Releasing $tag (previous: $latest)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+
+      # The token may only make a release whose tag is new while its commit is still a branch's head, and
+      # main moves on during the builds. The tag is made now, and the release later attaches to it. A tag
+      # that a failed run left behind is moved to this commit.
+      - name: Create the release tag
+        if: steps.tag.outputs.tag != ''
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: git push --force origin "$GITHUB_SHA:refs/tags/$TAG"
+
   desktop:
     name: ${{ matrix.target }}
+    needs: version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.version.outputs.tag }}
     strategy:
       matrix:
         include:
@@ -91,10 +139,11 @@ jobs:
   # The README says how.
   macos:
     name: macOS app
-    needs: desktop
+    needs: [version, desktop]
     runs-on: macos-latest
     timeout-minutes: 60
     env:
+      VERSION: ${{ needs.version.outputs.tag }}
       # What the keychain knows the app by, in its bundle and as a bare program alike.
       APP_ID: com.sierrasoftworks.Letters
     steps:
@@ -148,9 +197,11 @@ jobs:
   # the release's version.
   server:
     name: Server
+    needs: version
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
+      VERSION: ${{ needs.version.outputs.tag }}
       SERVER_TARGET: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v7
@@ -197,14 +248,15 @@ jobs:
   # never offered a release that lacks its system's program.
   publish:
     name: Publish
-    if: github.ref_type == 'tag'
-    needs: [desktop, macos, server]
+    if: needs.version.outputs.tag != ''
+    needs: [version, desktop, macos, server]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
       packages: write
     env:
+      VERSION: ${{ needs.version.outputs.tag }}
       SERVER_IMAGE: ghcr.io/sierrasoftworks/letters-server
     steps:
       - uses: actions/checkout@v7
@@ -215,7 +267,8 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # The image a deployment pulls by the release's version. `latest` stays main as CI last built it.
+      # The image a deployment pulls by the release's version, whole or in part: 1.2.3, 1.2 and 1.
+      # `latest` stays main as CI last built it.
       - name: Publish the server's image
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -224,19 +277,34 @@ jobs:
           cp dist/letters-server-x86_64-unknown-linux-musl "$RUNNER_TEMP/image/letters-server"
           chmod 755 "$RUNNER_TEMP/image/letters-server"
           cp /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/image/"
+          version=${VERSION#v}
           docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin <<<"$GHCR_TOKEN"
           docker build --file apps/letters-server/Dockerfile \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            --label "org.opencontainers.image.version=${VERSION#v}" \
-            --tag "$SERVER_IMAGE:${VERSION#v}" "$RUNNER_TEMP/image"
-          docker push "$SERVER_IMAGE:${VERSION#v}"
+            --label "org.opencontainers.image.version=$version" \
+            --tag "$SERVER_IMAGE:$version" --tag "$SERVER_IMAGE:${version%.*}" --tag "$SERVER_IMAGE:${version%%.*}" \
+            "$RUNNER_TEMP/image"
+          for tag in "$version" "${version%.*}" "${version%%.*}"; do docker push "$SERVER_IMAGE:$tag"; done
 
-      # A version with a suffix, as 1.2.0-rc.1, is a prerelease, which the app does not offer.
+      # A draft, or the one a failed run left, takes every file and is published only then.
       - name: Publish the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "$VERSION" dist/* --verify-tag --generate-notes --title "Letters ${VERSION#v}" \
-            --notes "macOS and Windows ask before they open Letters for the first time. [Installing]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY#installing) says how to allow it." \
-            ${{ contains(github.ref_name, '-') && '--prerelease' || '' }}
+        id: release
+        uses: SierraSoftworks/gh-releases@v1.1.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release_tag: ${{ needs.version.outputs.tag }}
+          create: "true"
+          publish: "true"
+          overwrite: "true"
+          notes-template: .github/release-notes.md
+          files: |
+            dist/letters-x86_64-unknown-linux-gnu
+            dist/letters-aarch64-unknown-linux-gnu
+            dist/letters-x86_64-pc-windows-msvc.exe
+            dist/letters-aarch64-apple-darwin
+            dist/letters-x86_64-apple-darwin
+            dist/Letters.dmg
+            dist/letters-server-x86_64-unknown-linux-musl
+
+      - run: echo "Published [${{ steps.release.outputs.tag }}](${{ steps.release.outputs.url }})" >>"$GITHUB_STEP_SUMMARY"
