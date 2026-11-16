@@ -1309,20 +1309,20 @@ fn a_file_that_is_no_document_yet_is_listed_under_its_document_or_offered_to_imp
     };
     let mut window = signed_in(&[HOME]);
     open(&mut window, held(Grade::Editor));
-    // A file follows the document of its name, however the list is ordered.
-    let by_name = ["Agenda.docx", "Minutes", "Minutes.docx", "Minutes.md", "Zoning"];
+    // A file with the name of a document has no row: the document's row names it.
+    let by_name = ["Agenda.docx", "Minutes", "Zoning"];
     assert_eq!(listed(&mut window, "Documents").0, by_name);
-    window.click(Role::Button, "Modified");
-    assert_eq!(listed(&mut window, "Documents").0, ["Minutes", "Minutes.docx", "Minutes.md", "Agenda.docx", "Zoning"]);
+    let said = window.find(Role::ListBoxOption, "Minutes").expect("listed").description.unwrap_or_default();
+    assert!(said.contains("Also kept as Minutes.docx, Minutes.md"), "{said}");
+    let said = window.find(Role::ListBoxOption, "Zoning").expect("listed").description.unwrap_or_default();
+    assert!(!said.contains("Also kept"), "{said}");
 
-    // Only the file with no document is offered, and pressing a row of either does nothing.
+    // The file with no document is offered, and pressing its row does nothing.
     let said = window.find(Role::ListBoxOption, "Agenda.docx").expect("listed").description.unwrap_or_default();
     assert!(said.starts_with("Word file"), "{said}");
-    for name in ["Agenda.docx", "Minutes.md"] {
-        let row = window.find(Role::ListBoxOption, name).expect("listed").bounds;
-        window.click_at(Point { x: row.x + 60.0, y: row.y + row.height / 2.0 });
-        assert_eq!(window.ui().take_requests(), [], "{name}");
-    }
+    let row = window.find(Role::ListBoxOption, "Agenda.docx").expect("listed").bounds;
+    window.click_at(Point { x: row.x + 60.0, y: row.y + row.height / 2.0 });
+    assert_eq!(window.ui().take_requests(), []);
     let import = button(&mut window, "Import", "As a new document").expect("offered to whoever edits there");
     window.click_at(import.center());
     let asked = Request::ImportFile { server: HOME.into(), space: "sam".into(), path: "Agenda.docx".into() };

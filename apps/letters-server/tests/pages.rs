@@ -344,7 +344,8 @@ async fn a_folders_page_lists_a_file_that_is_no_document_yet_and_makes_one_of_it
     }
     let here = paths::folder_page("family", "");
     let shown = page(&mut ben, &here).await;
-    assert!(shown.contains("Plan.md") && shown.contains("Roof.md"), "both are listed");
+    assert!(shown.contains("Also kept as Plan.md"), "the document's row names the file of its name");
+    assert!(shown.contains("Roof.md") && !shown.contains("Also kept as Roof.md"), "the other has a row");
     // Only the one with no document is offered, and only to whoever writes there.
     assert_eq!(shown.matches(&format!("action=\"{ACT_IMPORT_FILE}\"")).count(), 1);
     let mut guest = server.reader("guest", &["friends"]);

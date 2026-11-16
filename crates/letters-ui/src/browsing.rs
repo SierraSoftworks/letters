@@ -350,25 +350,15 @@ impl Browser {
         }
     }
 
-    /// What the place holds in the order it is listed in. A file in another format follows the document it
-    /// is listed under, however the rest are ordered.
+    /// What the place holds in the order it is listed in. A file in another format than the document of its
+    /// name has no row: that document's row says so.
     fn sorted<'a>(&self, entries: &'a [Entry]) -> Vec<&'a Entry> {
         let under = |entry: &Entry| {
             let beside = loose(entry).flatten()?;
             entries.iter().find(|above| above.id.is_some() && above.path == beside && above.space == entry.space)
         };
-        let (mut rows, mut nested): (Vec<&Entry>, Vec<&Entry>) =
-            entries.iter().partition(|entry| under(entry).is_none());
-        nested.sort_by_key(|entry| entry.name.to_lowercase());
-        let whole = |rows: Vec<&'a Entry>| {
-            let mut all = Vec::with_capacity(entries.len());
-            for row in rows {
-                all.push(row);
-                all.extend(nested.iter().copied().filter(|entry| under(entry).is_some_and(|at| std::ptr::eq(at, row))));
-            }
-            all
-        };
-        let Some((by, turned)) = self.order() else { return whole(rows) };
+        let mut rows: Vec<&Entry> = entries.iter().filter(|entry| under(entry).is_none()).collect();
+        let Some((by, turned)) = self.order() else { return rows };
         let folder = |entry: &Entry| entry.kind == EntryKind::Folder;
         rows.sort_by(|a, b| {
             let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
@@ -380,7 +370,7 @@ impl Browser {
             };
             folder(b).cmp(&folder(a)).then(if turned { within.reverse() } else { within })
         });
-        whole(rows)
+        rows
     }
 
     /// The folder that is looked at, by its space and its path there, if the person may write in it: a
@@ -822,14 +812,29 @@ impl Browser {
 
     /// One folder or document of the place. A folder is gone into, a document is opened, and a file that
     /// could not be read as a document is only listed. So is a conflict copy, which goes by the id of the
-    /// document it is a copy of: whoever edits there merges it into that document from its row. A Markdown
-    /// or Word file is only listed under the document of its name, and else whoever edits there makes a
-    /// document of it from its row. One that a search `found` says what folder it is in.
+    /// document it is a copy of: whoever edits there merges it into that document from its row. A document
+    /// that is also kept as a Markdown or Word file of its name is marked, and names those files under the
+    /// pointer. Of such a file with no document, whoever edits there makes one from its row. One that a
+    /// search `found` says what folder it is in.
     fn entry(&self, entry: &Entry, today: Option<i64>, room: Room, found: bool) -> Element<Message> {
         if let Some(beside) = loose(entry) {
             return self.file(entry, beside.is_some(), today, room);
         }
         let folder = entry.kind == EntryKind::Folder;
+        let also = self.also(entry);
+        let kept = (!also.is_empty()).then(|| format!("Also kept as {}", also.join(", ")));
+        let formats = kept.as_deref().map(|kept| {
+            Element::row()
+                .align(Align::Center)
+                .gap(tokens::SPACE_2XS)
+                .padding(Edges::xy(tokens::SPACE_XS, 1.0))
+                .radius(tokens::RADIUS_CONTROL)
+                .border(Edges::all(1.0), tokens::LINE)
+                .fg(tokens::FG_MUTED)
+                .child(Element::icon(icon::COPY, 12.0))
+                .child(Element::text(format!("+{}", also.len()), small()))
+                .tooltip(kept, Side::Top)
+        });
         let merges = copy(entry).filter(|_| entry.role >= Grade::Editor);
         let waits = merges.is_some_and(|(_, id)| self.busy.iter().any(|row| row == id));
         let merge = merges.map(|(of, id)| {
@@ -857,6 +862,7 @@ impl Browser {
         let told = [
             Some(kind.to_owned()),
             noted.clone(),
+            kept.clone(),
             by,
             made.as_ref().map(|made| format!("Created {made}")),
             when.as_ref().map(|when| format!("Modified {when}")),
@@ -873,6 +879,7 @@ impl Browser {
         let row = option(mark, &entry.name, false)
             .key(key.as_str())
             .description(about.join(", "))
+            .children(formats)
             .children(merge)
             .child(Element::row().width(0.0).grow(1.0).clip().children(noted))
             .children([writers(&entry.contributors), on(made)].into_iter().filter(|_| room == Room::Roomy))
@@ -906,8 +913,17 @@ fn does(entry: &Entry) -> Option<Browsing> {
 const NOTHING: &str = "Nothing here matches your search. Try fewer letters, or a filter such as author:sam, is:folder or before:2026-11-01.";
 
 impl Browser {
-    /// A Markdown or Word file the place keeps, which is no document yet. `nested` is whether it stands
-    /// under the document of its name.
+    /// The names of the Markdown and Word files the place keeps beside a document, under its name.
+    fn also(&self, entry: &Entry) -> Vec<&str> {
+        let beside = |file: &&Entry| loose(file).flatten() == Some(entry.path.as_str()) && file.space == entry.space;
+        let files = self.entries.iter().flatten().filter(|_| entry.id.is_some()).filter(beside);
+        let mut names: Vec<&str> = files.map(|file| file.name.as_str()).collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        names
+    }
+
+    /// A Markdown or Word file the place keeps, which is no document yet. `nested` is whether a document
+    /// has its name: it then has a row only where that document is not listed.
     fn file(&self, entry: &Entry, nested: bool, today: Option<i64>, room: Room) -> Element<Message> {
         let word = entry.name.to_lowercase().ends_with(".docx");
         let kind = if word { "Word file" } else { "Markdown file" };
@@ -931,13 +947,8 @@ impl Browser {
             .child(Element::row().width(0.0).grow(1.0).clip().children(noted.map(|noted| muted(noted).shrink())))
             .children(ends.into_iter().filter(|_| room == Room::Roomy))
             .children((room > Room::Tight).then(|| Element::row().width(DAY).child(muted(&when))));
-        match (nested, brings) {
-            // Set in as far as the name of the document over it.
-            (true, _) => row.padding(Edges { left: 2.0 * tokens::SPACE_SM + 16.0, ..Edges::xy(tokens::SPACE_SM, 0.0) }),
-            // The row is there for its button.
-            (false, true) => row,
-            (false, false) => row.disabled(true),
-        }
+        // The row is there for its button.
+        if brings { row } else { row.disabled(true) }
     }
 }
 
