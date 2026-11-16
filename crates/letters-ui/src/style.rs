@@ -106,6 +106,28 @@ impl Look {
     }
 }
 
+/// The sides on which an element is joined to what stands beside it, as the parts of one control are. Its
+/// corners there stay square, whatever its radius.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sides {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl Sides {
+    pub const NONE: Self = Self { top: false, right: false, bottom: false, left: false };
+    pub const TOP: Self = Self { top: true, ..Self::NONE };
+    pub const RIGHT: Self = Self { right: true, ..Self::NONE };
+    pub const BOTTOM: Self = Self { bottom: true, ..Self::NONE };
+    pub const LEFT: Self = Self { left: true, ..Self::NONE };
+
+    pub const fn any(self) -> bool {
+        self.top || self.right || self.bottom || self.left
+    }
+}
+
 /// How an element shows keyboard focus.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Ring {
@@ -144,6 +166,8 @@ pub struct Style {
     pub border: Edges,
     pub border_color: Option<Ink>,
     pub radius: f32,
+    /// The sides whose corners stay square.
+    pub square: Sides,
     pub shadow: &'static [Shadow],
     /// Applies to the element and everything in it.
     pub opacity: f32,
@@ -181,6 +205,7 @@ impl Default for Style {
             border: Edges::ZERO,
             border_color: None,
             radius: 0.0,
+            square: Sides::NONE,
             shadow: &[],
             opacity: 1.0,
             clip: false,

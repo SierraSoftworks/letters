@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 use std::rc::Rc;
 
-use letters_render::{DisplayList, Item, Point, Rect, Size};
+use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 
 use crate::color::{fade, resolve};
 use crate::element::Content;
 use crate::input::InputState;
 use crate::layout::inner;
-use crate::style::{Edges, Ring};
+use crate::style::{Edges, Ring, Sides};
 use crate::text::{Shaped, TextStyle};
 use crate::theme::accent;
 use crate::tokens::{self, Color as Ink, Scheme};
@@ -136,12 +136,13 @@ fn node<M>(
         });
     }
     if let Some(bg) = look.bg.or(style.inked.then_some(fg)) {
-        out.push(Item::Fill { rect, color: color(bg), radius: style.radius });
+        let color = color(bg);
+        rounded(&mut out.items, rect, style.radius, style.square, |rect, radius| Item::Fill { rect, color, radius });
     }
     if let Some(border) = look.border {
         match style.border.uniform() {
             Some(width) if width > 0.0 => {
-                out.push(Item::Stroke { rect, color: color(border), width, radius: style.radius })
+                outline(&mut out.items, rect, color(border), width, style.radius, style.square)
             }
             Some(_) => {}
             // One-sided rules, as under a bar or beside a panel.
@@ -162,9 +163,14 @@ fn node<M>(
 
     let ring_mark = rings.len();
     let mut visible = inherited.visible;
+    // A clip with square corners is two: the element's box, and the round one run out past its square sides.
+    let cut = style.clip && style.radius > 0.0 && style.square.any();
     if style.clip {
-        out.push(Item::PushClip { rect, radius: style.radius });
+        out.push(Item::PushClip { rect, radius: if cut { 0.0 } else { style.radius } });
         visible = intersect(visible, rect);
+    }
+    if cut {
+        out.push(Item::PushClip { rect: run_out(rect, style.radius, style.square), radius: style.radius });
     }
 
     let content = inner(rect, style);
@@ -252,12 +258,15 @@ fn node<M>(
             let ring = Rect::new(rect.x - grow, rect.y - grow, rect.width + 2.0 * grow, rect.height + 2.0 * grow);
             let radius = if style.radius > 0.0 { (style.radius + grow).max(0.0) } else { 0.0 };
             let ink = el.focused.border.unwrap_or(accent().focus());
-            rings.push(Item::Stroke { rect: ring, color: color(ink), width: RING, radius });
+            outline(rings, ring, color(ink), RING, radius, style.square);
         }
     }
     if style.clip {
         // Rings inside a clip are drawn before it ends, over the content they belong to.
         out.items.extend(rings.drain(ring_mark..));
+        out.push(Item::PopClip);
+    }
+    if cut {
         out.push(Item::PopClip);
     }
 }
@@ -271,6 +280,46 @@ pub(crate) fn scrollbar(view: Rect, content: f32, offset: f32, scheme: Scheme, o
     let travel = (view.height - length) * offset / (content - view.height);
     let rect = Rect::new(view.x + view.width - SCROLLBAR - 2.0, view.y + travel, SCROLLBAR, length);
     Some(Item::Fill { rect, color: resolve(fade(tokens::NEUTRAL, 0.45), scheme, opacity), radius: SCROLLBAR / 2.0 })
+}
+
+/// Draws a shape of `rect` whose corners are round by `radius`, but for those on the `square` sides. The shape
+/// runs out past those sides as far as its corners are deep and is cut back to `rect`, so that only the
+/// corners that stay round are seen.
+fn rounded(out: &mut Vec<Item>, rect: Rect, radius: f32, square: Sides, shape: impl Fn(Rect, f32) -> Item) {
+    if radius <= 0.0 || !square.any() {
+        return out.push(shape(rect, radius));
+    }
+    out.push(Item::PushClip { rect, radius: 0.0 });
+    out.push(shape(run_out(rect, radius, square), radius));
+    out.push(Item::PopClip);
+}
+
+/// `rect` run out by this much past these sides.
+fn run_out(rect: Rect, by: f32, sides: Sides) -> Rect {
+    let [top, right, bottom, left] = [sides.top, sides.right, sides.bottom, sides.left].map(|out| f32::from(out) * by);
+    Rect::new(rect.x - left, rect.y - top, rect.width + left + right, rect.height + top + bottom)
+}
+
+/// Draws the line inside the edge of `rect`, its corners round by `radius` but for those on the `square`
+/// sides.
+fn outline(out: &mut Vec<Item>, rect: Rect, color: Color, width: f32, radius: f32, square: Sides) {
+    rounded(out, rect, radius, square, |rect, radius| Item::Stroke { rect, color, width, radius });
+    if radius <= 0.0 || !square.any() {
+        return;
+    }
+    // The line of a square side ran out of sight with the corners: it is drawn by itself, between the lines it
+    // meets, so that no part of the line is drawn twice.
+    let (right, bottom) = (rect.x + rect.width - width, rect.y + rect.height - width);
+    let (from, to) = (f32::from(!square.left) * width, f32::from(!square.right) * width);
+    let across = |y: f32| Rect::new(rect.x + from, y, rect.width - from - to, width);
+    let down = |x: f32| Rect::new(x, rect.y + width, width, rect.height - 2.0 * width);
+    let sides = [
+        square.top.then(|| across(rect.y)),
+        square.bottom.then(|| across(bottom)),
+        square.left.then(|| down(rect.x)),
+        square.right.then(|| down(right)),
+    ];
+    out.extend(sides.into_iter().flatten().map(|rect| Item::Fill { rect, color, radius: 0.0 }));
 }
 
 fn intersect(a: Rect, b: Rect) -> Rect {

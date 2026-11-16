@@ -5,10 +5,13 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use letters_editor::{InputEvent, Key, KeyEvent, Modifiers, Platform};
-use letters_render::{DisplayList, Item, Point, Rect, Size};
+use letters_render::cpu::{CpuRenderer, Frame};
+use letters_render::image::Images;
+use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 use letters_test::{Harness, Role, WINDOW};
+use letters_ui::color::{fade, same};
 use letters_ui::widgets::{Button, Menu, MenuItem, Popover, SidePanel, TextField, TopBar};
-use letters_ui::{App, Edges, Element, Paint, Scheme, TextStyle};
+use letters_ui::{Align, App, Edges, Element, Paint, Ring, Scheme, Sides, TextStyle};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Msg {
@@ -734,4 +737,82 @@ fn the_keyboard_goes_to_an_heir_in_the_dialog_when_what_had_it_goes_and_nowhere_
     late.click(Role::Button, "Three");
     assert_eq!(late.app().left, ["One"]);
     assert_eq!(focus_of(&mut late), nowhere, "nothing is pressed by an Enter the person did not aim");
+}
+
+/// Four boxes with corners this round, joined to something on these sides: one filled, one with a line round
+/// it, one cut about what it holds, and one with the keyboard on it.
+struct Joined(Sides, f32);
+
+impl App for Joined {
+    type Msg = ();
+
+    fn title(&self) -> String {
+        "Joined".into()
+    }
+
+    fn view(&mut self, _window: Size) -> Element<()> {
+        // An ink that shows where it was laid on twice.
+        let ink = fade(same(200, 30, 30), 0.5);
+        let shape = |name: &str| {
+            Element::row().width(80.0).height(60.0).radius(self.1).square(self.0).role(Role::Group).label(name)
+        };
+        // What the third holds runs out past it on every side, so that only the cut shapes it.
+        let held = Element::row().width(120.0).height(100.0).bg(ink);
+        let held = Element::column().width(80.0).height(100.0).align(Align::Center).child(held);
+        Element::column()
+            .padding(Edges::all(20.0))
+            .gap(20.0)
+            .child(shape("Filled").bg(ink))
+            .child(shape("Lined").border(Edges::all(4.0), ink))
+            .child(shape("Cut").align(Align::Center).clip().child(held))
+            .child(shape("Ringed").focusable().ring(Ring::Outline(-4.0)))
+    }
+
+    fn update(&mut self, _message: (), _platform: &mut dyn Platform) {}
+}
+
+#[test]
+fn a_box_is_square_at_the_corners_of_the_sides_it_is_joined_on_and_round_at_the_rest() {
+    let both = Sides { left: true, ..Sides::TOP };
+    let every = Sides { top: true, right: true, bottom: true, left: true };
+    let round =
+        [Sides::NONE, Sides::TOP, Sides::RIGHT, Sides::BOTTOM, Sides::LEFT, both, every].map(|sides| (sides, 16.0));
+    // A box that is round nowhere is as square joined as not.
+    for (sides, radius) in round.into_iter().chain([(Sides::NONE, 0.0), (both, 0.0)]) {
+        let mut window = Harness::new(Joined(sides, radius));
+        window.key("Tab");
+        let list = window.paint();
+        let mut frame = Frame::new(WINDOW.width as u32, WINDOW.height as u32);
+        CpuRenderer::new().render(&list, &Images::default(), 1.0, Color::rgb(255, 255, 255), &mut frame);
+        let at = |x: f32, y: f32| frame.pixel(x as u32, y as u32);
+        let paper = at(1.0, 1.0);
+        for name in ["Filled", "Lined", "Cut", "Ringed"] {
+            let shape = window.find(Role::Group, name).expect(name).bounds;
+            // A little inside each edge, where a line or a ring runs, and half way along each side.
+            let (left, top) = (shape.x + 2.0, shape.y + 2.0);
+            let (right, bottom) = (shape.x + shape.width - 3.0, shape.y + shape.height - 3.0);
+            let (across, down) = (shape.x + shape.width / 2.0, shape.y + shape.height / 2.0);
+            let ink = at(across, top);
+            assert_ne!(ink, paper, "{name} joined on {sides:?}: drawn at all");
+            // Every side is drawn the whole way, joined or not, in one ink, and nothing is drawn beyond it.
+            for (x, y) in [(right, down), (across, bottom), (left, down)] {
+                assert_eq!(at(x, y), ink, "{name} joined on {sides:?}: the side at {x}, {y}");
+            }
+            let beyond = [(across, top - 5.0), (right + 5.0, down), (across, bottom + 5.0), (left - 5.0, down)];
+            for (x, y) in beyond {
+                assert_eq!(at(x, y), paper, "{name} joined on {sides:?}: beyond it at {x}, {y}");
+            }
+            // A corner is drawn into where a side it lies on is joined, once, and is left out where it is round.
+            let corners = [
+                (left, top, sides.left || sides.top),
+                (right, top, sides.right || sides.top),
+                (right, bottom, sides.right || sides.bottom),
+                (left, bottom, sides.left || sides.bottom),
+            ];
+            for (x, y, square) in corners {
+                let wanted = if square || radius == 0.0 { ink } else { paper };
+                assert_eq!(at(x, y), wanted, "{name} joined on {sides:?}: the corner at {x}, {y}");
+            }
+        }
+    }
 }

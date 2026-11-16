@@ -95,7 +95,7 @@ pub use safe::SafeMode;
 pub use servers::{Server, SignIn};
 pub use settings::{Appearance, Settings};
 pub use sharing::{Shared, Sharing, Tab, Take};
-pub use style::{Align, Dir, Edges, Justify, Look, Ring, Style};
+pub use style::{Align, Dir, Edges, Justify, Look, Ring, Sides, Style};
 pub use text::{Family, FixedShaper, FontShaper, GlyphRun, Shaped, Stop, TextShaper, TextStyle};
 pub use theme::Accent;
 pub use tokens::{Color as Ink, Scheme};

@@ -315,6 +315,14 @@ fn lines(window: &mut Harness) -> Vec<(Rect, f32, f32)> {
     drawn.collect()
 }
 
+/// The window as its pixels, one to a point.
+fn shot(window: &mut Harness) -> Frame {
+    let (list, images) = (window.paint(), window.ui().images().clone());
+    let mut frame = Frame::new(WINDOW.width as u32, WINDOW.height as u32);
+    CpuRenderer::new().render(&list, &images, 1.0, Color::rgb(255, 255, 255), &mut frame);
+    frame
+}
+
 #[test]
 fn a_group_is_added_from_one_control_in_one_frame() {
     let mut window = plan();
@@ -341,27 +349,38 @@ fn a_group_is_added_from_one_control_in_one_frame() {
     assert_eq!((frame.x, frame.width), (people.x, people.width));
     assert!((frame.height - part(&mut window, Role::Button, "Done").height).abs() < 0.5, "{frame:?}");
 
-    // The field's ring lies on the frame, corners and all. A button's ring keeps inside the button, and is
-    // round where the button has the frame's corners.
+    assert!(corner > 0.0, "the frame is round");
+
+    // A part is round only at the corners it has of the frame, and square where it is joined to the next.
+    // The field's ring lies on the frame, and runs square down the line between the field and the button.
     window.click(Role::TextInput, "Add a group").type_text("Finance");
-    let ring = |window: &mut Harness| lines(window).into_iter().find(|(rect, width, _)| touches(rect) && *width > 1.0);
-    let (on, _, round) = ring(&mut window).expect("the field's ring");
-    assert_eq!((on.x, on.y, on.height, round), (frame.x, frame.y, frame.height, corner));
+    let lit = shot(&mut window);
+    let at = |x: f32, y: f32| lit.pixel(x as u32, y as u32);
+    let (middle, foot) = (frame.y + frame.height / 2.0, frame.y + frame.height - 1.0);
+    let ring = at(frame.x, middle);
+    assert_ne!(ring, at(frame.x - 2.0, middle), "the ring shows on the frame's line");
+    let line = field.x + field.width;
+    assert_eq!([at(line, frame.y), at(line, middle), at(line, foot)], [ring; 3], "square down the line");
+    assert!(at(frame.x, frame.y) != ring && at(frame.x, foot) != ring, "and round with the frame");
+    // A button's ring keeps inside the button, and is round only where the button has the frame's corners.
     for (button, ends) in [(add, false), (others, true)] {
         window.key("Tab");
-        let (on, _, round) = ring(&mut window).expect("the button's ring");
-        let inside = on.x >= button.x && on.x + on.width <= button.x + button.width && on.y >= button.y;
-        assert!(inside && on.y + on.height <= button.y + button.height, "{on:?} in {button:?}");
-        assert_eq!(round > 0.0, ends, "{button:?}");
+        let lit = shot(&mut window);
+        let at = |x: f32, y: f32| lit.pixel(x as u32, y as u32);
+        let (left, top) = (button.x + 1.0, button.y + 1.0);
+        let (right, bottom) = (button.x + button.width - 2.0, button.y + button.height - 2.0);
+        assert!(at(left, middle) == ring && at(button.x - 1.0, middle) != ring, "inside {button:?}");
+        assert_eq!([at(left, top), at(left, bottom)], [ring; 2], "square where it is joined: {button:?}");
+        assert_eq!([at(right, top) == ring, at(right, bottom) == ring], [!ends; 2], "{button:?}");
     }
-}
-
-/// The window as its pixels, one to a point.
-fn shot(window: &mut Harness) -> Frame {
-    let (list, images) = (window.paint(), window.ui().images().clone());
-    let mut frame = Frame::new(WINDOW.width as u32, WINDOW.height as u32);
-    CpuRenderer::new().render(&list, &images, 1.0, Color::rgb(255, 255, 255), &mut frame);
-    frame
+    // So is what shows a button is under the pointer.
+    window.hover_at(letters_render::Point { x: others.x + others.width / 2.0, y: middle });
+    let lit = shot(&mut window);
+    let at = |x: f32, y: f32| lit.pixel(x as u32, y as u32);
+    let (right, under) = (others.x + others.width - 1.0, at(others.x + 3.0, others.y + 3.0));
+    assert_ne!(under, at(add.x + 3.0, add.y + 3.0), "the button under the pointer shows it");
+    assert_eq!([at(others.x, others.y), at(others.x, foot - 1.0)], [under; 2], "square beside the line");
+    assert!(at(right, others.y) != under && at(right, foot - 1.0) != under, "round with the frame");
 }
 
 #[test]

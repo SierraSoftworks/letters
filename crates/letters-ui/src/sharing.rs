@@ -15,7 +15,7 @@ use crate::color::fade;
 use crate::element::Element;
 use crate::icon::{self, Icon};
 use crate::opening::{Request, date_called, day};
-use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
+use crate::style::{Align, Dir, Edges, Justify, Look, Ring, Sides};
 use crate::text::TextStyle;
 use crate::theme::accent;
 use crate::threads::initials;
@@ -469,12 +469,13 @@ impl Share {
         // Both menus hang from the dialog's right edge, and open inwards from it.
         let others =
             Button::icon_only(icon::CHEVRON_DOWN, "Add with another role").popover(others.popover().align(Align::End));
-        // Each part gives up its own line for the frame's and stands a line from the next. The parts at the
-        // ends keep the frame's corners, so the field's ring lies on the frame, and a button's ring is drawn
-        // inside it, clear of its neighbours.
-        let inside = tokens::RADIUS_CONTROL - 1.0;
-        let part = |part: Element<Message>, corner: f32| {
-            let mut part = part.height(tokens::CONTROL_HEIGHT - 2.0).radius(corner);
+        // Each part gives up its own line for the frame's and stands a line from the next. A part is round
+        // only at the corners it shares with the frame and square where it is joined to the next, so the
+        // field's ring lies on the frame and on the line beside it, and a button's ring is drawn inside it,
+        // clear of its neighbours.
+        let part = |part: Element<Message>, joined: Sides| {
+            let mut part =
+                part.height(tokens::CONTROL_HEIGHT - 2.0).radius(tokens::RADIUS_CONTROL - 1.0).square(joined);
             part.style.border = Edges::ZERO;
             part
         };
@@ -482,11 +483,11 @@ impl Share {
         Element::row()
             .border(Edges::all(1.0), tokens::LINE_STRONG)
             .radius(tokens::RADIUS_CONTROL)
-            .child(part(Element::from(field).grow(1.0), inside))
+            .child(part(Element::from(field).grow(1.0), Sides::RIGHT))
             .child(line())
-            .child(part(add.into(), 0.0).ring(Ring::Outline(-3.0)))
+            .child(part(add.into(), Sides { left: true, ..Sides::RIGHT }).ring(Ring::Outline(-3.0)))
             .child(line())
-            .child(part(others.into(), inside).ring(Ring::Outline(-3.0)))
+            .child(part(others.into(), Sides::LEFT).ring(Ring::Outline(-3.0)))
     }
 
     /// The links made for the document, newest first.

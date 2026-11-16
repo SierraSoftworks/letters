@@ -14,7 +14,7 @@ use letters_render::{DisplayList, Point, Rect};
 
 use crate::chrome::Edge;
 use crate::icon::Icon;
-use crate::style::{Align, Dir, Edges, Justify, Look, Ring, Style};
+use crate::style::{Align, Dir, Edges, Justify, Look, Ring, Sides, Style};
 use crate::text::TextStyle;
 use crate::tokens::{Color as Ink, Scheme, Shadow};
 use crate::widgets::{Popover, Side};
@@ -382,6 +382,13 @@ impl<M> Element<M> {
 
     pub fn radius(mut self, radius: f32) -> Self {
         self.style.radius = radius;
+        self
+    }
+
+    /// Keeps the corners on these sides square, where the element is joined to what stands beside it. Its
+    /// fill, its border, its focus ring and what it clips follow. Its shadow does not.
+    pub fn square(mut self, sides: Sides) -> Self {
+        self.style.square = sides;
         self
     }
 
