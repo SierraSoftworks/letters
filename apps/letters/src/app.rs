@@ -234,6 +234,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         from_server,
         sessions: HashMap::new(),
         servers_told: false,
+        open_asked: None,
         signing: HashMap::new(),
         proxy: event_loop.create_proxy(),
         platform: Desktop::new().with_words(Words::of(&home)),
@@ -455,6 +456,10 @@ struct App {
     /// Whether the kept sessions have been read, after the first frame. The windows hear where the
     /// person is signed in from then on.
     servers_told: bool,
+    /// The window that asked to open a document before the keychain had said where the person is signed
+    /// in, and whether its landing card showed. It is answered once that is known, with the card of a
+    /// server's documents if there is a server, so a press at launch does not fall to the system's dialog.
+    open_asked: Option<(WindowId, bool)>,
     /// The sign-ins under way, by the window that waits for each.
     signing: HashMap<WindowId, Signing>,
     /// The person's home folder, where the copies of servers' documents are kept.
@@ -895,8 +900,11 @@ const NO_PICTURE: &str = "it is not a picture Letters can show";
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
     New,
-    /// Opens the document at a path, or one the person picks.
+    /// Opens the document at a path, or one the person picks in the system's dialog.
     Open(Option<PathBuf>),
+    /// Opens a document as the window's own Open does: from its card of a server's documents while the
+    /// person is signed in to one, else from the system's dialog.
+    Choose,
     Save,
     Close,
     Quit,
@@ -908,7 +916,7 @@ fn shortcut(event: &KeyEvent) -> Option<Action> {
     }
     Some(match event.key {
         Key::Char('n') => Action::New,
-        Key::Char('o') => Action::Open(None),
+        Key::Char('o') => Action::Choose,
         Key::Char('s') => Action::Save,
         Key::Char('w') => Action::Close,
         Key::Char('q') => Action::Quit,
@@ -2517,6 +2525,10 @@ impl App {
                     Some((origin, document)) => self.reach(Some(id), &origin, document),
                     None => self.act(event_loop, id, Action::Open(Some(path.into()))),
                 },
+                Request::OpenDialog if !self.servers_told => {
+                    let landing = self.windows.get(&id).is_some_and(|window| window.view.landing());
+                    self.open_asked = Some((id, landing));
+                }
                 Request::OpenDialog => self.act(event_loop, id, Action::Open(None)),
                 Request::New => self.act(event_loop, id, Action::New),
                 // The name is taken on the way to a save, which reads it from the document. A server's
@@ -3828,6 +3840,14 @@ impl App {
                     alert(None, &format!("A new window could not be opened{}.", no_window(&*error)));
                 }
             }
+            Action::Choose => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                window.view.run_command("Open", &mut self.platform);
+                window.access_stale = true;
+                let now = Instant::now();
+                window.sync(now);
+                self.serve(event_loop, id, now);
+            }
             Action::Open(path) => {
                 let Some(window) = self.windows.get(&id) else { return };
                 let pick = || {
@@ -4331,6 +4351,15 @@ impl ApplicationHandler<Event> for App {
                 }
                 self.servers_told = true;
                 self.tell_servers(now);
+                // An Open that waited for this is done now, unless the person went on to something else.
+                if let Some((id, landing)) = self.open_asked.take()
+                    && let Some(window) = self.windows.get_mut(&id).filter(|window| window.view.landing() == landing)
+                {
+                    window.view.run_command("Open", &mut self.platform);
+                    window.access_stale = true;
+                    window.sync(now);
+                    self.serve(event_loop, id, now);
+                }
             }
             Event::SigningIn(id, given_up, name, page) => {
                 let waits = |signing: &&mut Signing| Arc::ptr_eq(&signing.given_up, &given_up);
