@@ -9,7 +9,7 @@ use axum::http::{Method, StatusCode};
 use common::{Server, names};
 use letters_api::{
     Code, Entry, EntryKind, Error, Listing, Move, NewDocument, NewFolder, Opened, Rename, Role, Settings, Space,
-    SpaceKind, Tag, Trust, paths,
+    SpaceKind, Tag, Trashed, Trust, paths,
 };
 use letters_format::{Archive, MIMETYPE, OPLOG, WorkingCopy};
 use letters_model::{Block, BlockId, BlockKind, Document, Model, Notes, ReplicaId, Style, TagKind};
@@ -240,6 +240,57 @@ async fn a_folder_is_renamed_moved_and_thrown_away_with_what_it_holds() {
     assert!(listed(&ben, "home", "").await.is_empty());
     assert_eq!(ben.get::<Opened>(&paths::document(&id)).await.expect_err("in the trash").code, Code::NotFound);
     assert_eq!(server.scratch.names("home/ben/.letters-trash/Roof"), ["Quote.let"], "kept whole, out of sight");
+}
+
+#[tokio::test]
+async fn what_is_thrown_away_is_listed_and_put_back_by_whoever_edits_its_space() {
+    let server = Server::new("trash-listed");
+    let (ben, guest) = (server.person("ben", &["family"]), server.person("guest", &["friends"]));
+    folders(&ben, &["House", "House/Roof"]).await;
+    let quote = ben.start("family", "House", "Quote").await.id.unwrap();
+    ben.start("family", "House/Roof", "Tiles").await;
+    let diary = ben.start("home", "", "Diary").await.id.unwrap();
+    // A document goes, then the folder beside it with what that holds, then a document of Ben's own.
+    for thrown in [paths::trash(&quote), paths::trash_folder("family", "House/Roof"), paths::trash(&diary)] {
+        ben.post::<()>(&thrown, &()).await.expect("thrown away");
+        server.wait(10);
+    }
+
+    // The trash tells what each was and where, the last thrown away first.
+    let told = |trash: &[Trashed]| -> Vec<(String, EntryKind, String, String, Role)> {
+        let row = |thrown: &Trashed| {
+            (thrown.space.clone(), thrown.kind, thrown.name.clone(), thrown.folder.clone(), thrown.role)
+        };
+        trash.iter().map(row).collect()
+    };
+    let row = |space: &str, kind, name: &str, folder: &str, role| {
+        (space.to_owned(), kind, name.to_owned(), folder.to_owned(), role)
+    };
+    let trash: Vec<Trashed> = ben.get(paths::TRASH).await.unwrap();
+    let family = |role| {
+        [
+            row("family", EntryKind::Folder, "Roof", "House", role),
+            row("family", EntryKind::Document, "Quote", "House", role),
+        ]
+    };
+    let own = row("home", EntryKind::Document, "Diary", "", Role::Owner);
+    assert_eq!(told(&trash), [vec![own], family(Role::Editor).to_vec()].concat());
+
+    // A reader of a space sees its trash and takes nothing out of it. Nobody sees another's own.
+    let seen: Vec<Trashed> = guest.get(paths::TRASH).await.unwrap();
+    assert_eq!(told(&seen), family(Role::Reader));
+    let back = |thrown: &Trashed| paths::put_back(&thrown.space, &thrown.file);
+    assert_eq!(guest.post::<Entry>(&back(&seen[0]), &()).await.expect_err("by a reader").code, Code::Forbidden);
+
+    // Each comes back where it was, the folder with what it held, and is in the trash no more.
+    let roof: Entry = ben.post(&back(&trash[1]), &()).await.expect("the folder is back");
+    let quote: Entry = ben.post(&back(&trash[2]), &()).await.expect("the document is back");
+    assert_eq!((roof.kind, roof.path.as_str()), (EntryKind::Folder, "House/Roof"));
+    assert_eq!((quote.kind, quote.path.as_str()), (EntryKind::Document, "House/Quote.let"));
+    assert_eq!(names(&listed(&ben, "family", "House/Roof").await), ["Tiles"]);
+    assert_eq!(told(&ben.get::<Vec<Trashed>>(paths::TRASH).await.unwrap()).len(), 1);
+    let twice = ben.post::<Entry>(&back(&trash[2]), &()).await;
+    assert_eq!(twice.expect_err("it is in the trash no more").code, Code::NotFound);
 }
 
 #[tokio::test]

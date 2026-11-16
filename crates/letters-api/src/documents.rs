@@ -84,6 +84,26 @@ pub struct Entry {
     pub tags: Vec<Tag>,
 }
 
+/// A document or a folder in the trash of a space.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trashed {
+    pub kind: EntryKind,
+    /// The name it had, to show.
+    pub name: String,
+    /// The [`Space::id`] whose trash it is in.
+    pub space: String,
+    /// The folder it was in, by its path in the space. Empty for the top of the space, and for a file
+    /// that some other program put in the trash.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub folder: String,
+    /// What names it in the trash, to have it back with: see [`paths::put_back`](crate::paths::put_back).
+    pub file: String,
+    /// When it was thrown away.
+    pub thrown: u64,
+    /// What the session may do in its space. Whoever edits there may put it back.
+    pub role: Role,
+}
+
 /// What a folder holds: its folders first, then its documents, each by name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listing {

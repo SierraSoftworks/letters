@@ -16,7 +16,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use letters_api::{
     Action, Allows, Code, Entry, EntryKind, Fetch, Listing, Move, NewDocument, NewFolder, Opened, PROTOCOL, Person,
-    Preview, Rename, Renewal, Role, Server, Settings, Space, Tag, Token, Trust, paths,
+    Preview, Rename, Renewal, Role, Server, Settings, Space, Tag, Token, Trashed, Trust, paths,
 };
 use letters_format::{ASSETS, Archive, MIMETYPE, NOTES, Reading, STYLE, file_name};
 use letters_model::{Document, ReplicaId};
@@ -64,6 +64,8 @@ pub fn routes() -> Router<Shared> {
         .route("/api/v1/spaces/{space}/folders/rename", post(rename_folder))
         .route("/api/v1/spaces/{space}/folders/move", post(move_folder))
         .route("/api/v1/spaces/{space}/folders/trash", post(trash_folder))
+        .route(paths::TRASH, get(trashed))
+        .route("/api/v1/spaces/{space}/trash/put-back", post(put_back))
         .route("/api/v1/documents/{id}", get(document))
         .route(
             "/api/v1/documents/{id}/file",
@@ -448,6 +450,26 @@ async fn relocate(
     blocking(move || app.relocate(&who, &id, &to).map(Json)).await
 }
 
+async fn trashed(State(app): State<Shared>, who: Signed) -> Answer<Json<Vec<Trashed>>> {
+    blocking(move || Ok(Json(app.trashed(&who)))).await
+}
+
+/// What is asked back out of a trash: its name there.
+#[derive(Deserialize)]
+struct Back {
+    #[serde(default)]
+    file: String,
+}
+
+async fn put_back(
+    State(app): State<Shared>,
+    who: Signed,
+    Path(space): Path<String>,
+    Query(back): Query<Back>,
+) -> Answer<Json<Entry>> {
+    blocking(move || app.put_back(&who, &space, &back.file).map(Json)).await
+}
+
 async fn trash(State(app): State<Shared>, who: Signed, Path(id): Path<String>) -> Answer<()> {
     blocking(move || app.trash(&who, &id)).await
 }
@@ -744,6 +766,30 @@ impl App {
             merged.push(shown(&copy.listed.name).to_owned());
         }
         Ok(merged)
+    }
+
+    /// What is in the trash of every space `who` reaches, the last thrown away first. A space whose trash
+    /// cannot be read now tells none of it, and the others still do.
+    pub fn trashed(&self, who: &Signed) -> Vec<Trashed> {
+        let mut trashed = Vec::new();
+        for (space, root) in self.reach(who) {
+            for (listed, was) in self.library.thrown(&self.store, &root).unwrap_or_default() {
+                // A file some other program put in the trash is known by its name there alone.
+                let path = was.as_ref().map_or(listed.name.as_str(), |was| was.path.as_str());
+                let (folder, name) = path.rsplit_once('/').unwrap_or(("", path));
+                trashed.push(Trashed {
+                    kind: if listed.folder { EntryKind::Folder } else { EntryKind::Document },
+                    name: shown(name).to_owned(),
+                    space: space.id.clone(),
+                    folder: folder.to_owned(),
+                    file: listed.name.clone(),
+                    thrown: was.as_ref().map_or(seconds(listed.stamp), |was| was.at),
+                    role: space.role,
+                });
+            }
+        }
+        trashed.sort_by_key(|trashed| std::cmp::Reverse(trashed.thrown));
+        trashed
     }
 
     /// Puts `file` back from the trash of `space`, and says where it is now.

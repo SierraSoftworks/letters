@@ -3,7 +3,8 @@
 
 use letters_api::{
     Access, Action, Allows, Code, Entry, EntryKind, Error, Grant, Grantee, Limits, Link, Listing, NewLink, Opened,
-    PROTOCOL, Person, Role, Seen, Server, Settings, Shares, Space, SpaceKind, Tag, Token, Trust, Via, Who, paths,
+    PROTOCOL, Person, Role, Seen, Server, Settings, Shares, Space, SpaceKind, Tag, Token, Trashed, Trust, Via, Who,
+    paths,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -71,6 +72,15 @@ fn every_body_reads_back_as_written() {
     let space = Space { id: "home".into(), name: "Home".into(), kind: SpaceKind::Personal, role: Role::Owner };
     round_trip(&Listing { space, path: "House".into(), entries: vec![entry()] });
     round_trip(&Seen { revision: "r1".into() });
+    round_trip(&Trashed {
+        kind: EntryKind::Folder,
+        name: "Roof".into(),
+        space: "family".into(),
+        folder: "House".into(),
+        file: "Roof 2".into(),
+        thrown: 10,
+        role: Role::Editor,
+    });
     round_trip(&Opened {
         id: "doc-1".into(),
         created: "2026-11-14T09:00:00Z".into(),
@@ -226,6 +236,7 @@ fn an_address_keeps_each_part_in_its_place() {
         (paths::assets("doc 1"), "/api/v1/documents/doc%201/assets"),
         (paths::seen("doc 1"), "/api/v1/documents/doc%201/seen"),
         (paths::dictionary_aff("de-CH"), "/api/v1/dictionaries/de-CH/aff"),
+        (paths::put_back("family", "Roof & co.let"), "/api/v1/spaces/family/trash/put-back?file=Roof%20%26%20co.let"),
         (paths::dictionary_dic("../x"), "/api/v1/dictionaries/..%2Fx/dic"),
         (paths::merge_conflicts("doc 1"), "/api/v1/documents/doc%201/merge-conflicts"),
         (paths::asset("doc 1", "ab12.png"), "/api/v1/documents/doc%201/assets/ab12.png"),

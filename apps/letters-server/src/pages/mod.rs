@@ -40,7 +40,7 @@ use crate::error::{Answer, Refusal};
 use crate::links::Caller;
 use crate::session::{Carrier, Reader, Signed, named_document};
 use crate::shares::may_share;
-use crate::spaces::{Place, seconds, shown};
+use crate::spaces::Place;
 use crate::{App, Shared};
 
 use self::statics::statics;
@@ -468,27 +468,19 @@ async fn trash(State(app): State<Shared>, Visitor(who): Visitor, Query(asked): Q
         let (app, who) = (app.clone(), who.clone());
         move || {
             let now = app.now();
-            let mut trashed = Vec::new();
-            for (space, root) in app.reach(&who) {
-                // A space whose trash cannot be read now shows none of it, and the others still do.
-                for (listed, was) in app.library.thrown(&app.store, &root).unwrap_or_default() {
-                    // A file some other program put in the trash is known by its name there alone.
-                    let path = was.as_ref().map_or(listed.name.as_str(), |was| was.path.as_str());
-                    let (folder, name) = path.rsplit_once('/').unwrap_or(("", path));
-                    let at = was.as_ref().map_or(seconds(listed.stamp), |was| was.at);
-                    let thrown = Trashed {
-                        folder: listed.folder,
-                        from: trail(&space.name, folder),
-                        name: shown(name).to_owned(),
-                        file: listed.name.clone(),
-                        thrown: when(at, now),
-                        space: space.clone(),
-                    };
-                    trashed.push((at, thrown));
-                }
-            }
-            trashed.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
-            let trashed = trashed.into_iter().map(|(_, trashed)| trashed).collect();
+            let spaces: Vec<_> = app.spaces(&who).into_iter().map(|(space, role)| space.told(role)).collect();
+            let row = |thrown: letters_api::Trashed| {
+                let space = spaces.iter().find(|space| space.id == thrown.space)?.clone();
+                Some(Trashed {
+                    folder: thrown.kind == EntryKind::Folder,
+                    from: trail(&space.name, &thrown.folder),
+                    name: thrown.name,
+                    file: thrown.file,
+                    thrown: when(thrown.thrown, now),
+                    space,
+                })
+            };
+            let trashed = app.trashed(&who).into_iter().filter_map(row).collect();
             Ok(page(&app, Some(&who), At::Trash, Body::Trash(trashed)))
         }
     });

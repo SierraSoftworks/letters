@@ -51,6 +51,9 @@ pub fn dictionary_dic(tag: &str) -> String {
 pub const SPACES: &str = "/api/v1/spaces";
 /// `GET`: the documents the person opened lately, as [`Entry`](crate::Entry)s, newest first.
 pub const RECENT: &str = "/api/v1/recent";
+/// `GET`: what is in the trash of every space the session reaches, as [`Trashed`](crate::Trashed)s, the last
+/// thrown away first.
+pub const TRASH: &str = "/api/v1/trash";
 /// `GET`: the documents shared with the person from beyond their spaces, as [`Entry`](crate::Entry)s.
 pub const SHARED: &str = "/api/v1/shared";
 /// `GET`: who a document can be shared with, as [`Grantee`](crate::Grantee)s: everyone else who has signed
@@ -162,6 +165,13 @@ pub fn rename(id: &str) -> String {
 /// `POST` a [`Move`](crate::Move): the document's [`Entry`](crate::Entry) where it now is.
 pub fn relocate(id: &str) -> String {
     format!("{}/move", document(id))
+}
+
+/// `POST`: takes what a [`Trashed`](crate::Trashed) names by its `file` out of the trash of `space` and puts
+/// it back where it was, or at the top of the space where its folder is gone: its [`Entry`](crate::Entry).
+/// Under its own name, or the first numbered one that is free there.
+pub fn put_back(space: &str, file: &str) -> String {
+    format!("{SPACES}/{}/trash/put-back?file={}", segment(space), segment(file))
 }
 
 /// `POST`: moves the document to its space's trash.

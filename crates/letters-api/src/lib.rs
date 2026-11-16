@@ -22,7 +22,7 @@ mod sharing;
 
 pub use documents::{
     Entry, EntryKind, Fetch, Listing, Move, NewDocument, NewFolder, Opened, Preview, Rename, Seen, Space, SpaceKind,
-    Tag, Trust,
+    Tag, Trashed, Trust,
 };
 pub use error::{Code, Error};
 pub use session::{Appearance, Exchange, Limits, Person, Renewal, Server, Settings, Token};
