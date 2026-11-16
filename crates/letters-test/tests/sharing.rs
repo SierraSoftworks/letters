@@ -305,6 +305,90 @@ fn a_group_is_added_by_its_name() {
     }
 }
 
+/// The lines drawn round something in the window, with how wide and how round each is.
+fn lines(window: &mut Harness) -> Vec<(Rect, f32, f32)> {
+    let drawn = window.paint().items.into_iter().filter_map(|item| match item {
+        Item::Stroke { rect, width, radius, .. } => Some((rect, width, radius)),
+        _ => None,
+    });
+    drawn.collect()
+}
+
+#[test]
+fn a_group_is_added_from_one_control_in_one_frame() {
+    let mut window = plan();
+    open(&mut window, shared(true, Vec::new()));
+    let part = |window: &mut Harness, role: Role, name: &str| window.find(role, name).expect("a part of it").bounds;
+    let field = part(&mut window, Role::TextInput, "Add a group");
+    let add = part(&mut window, Role::Button, "Add reader");
+    let others = part(&mut window, Role::Button, "Add with another role");
+    // Nothing stands between the parts but a line, and they are as tall as each other.
+    for (left, right) in [(field, add), (add, others)] {
+        let line = Rect::new(left.x + left.width, left.y, 1.0, left.height);
+        let drawn =
+            window.paint().items.into_iter().any(|item| matches!(item, Item::Fill { rect, .. } if rect == line));
+        assert!(drawn && right.x == line.x + line.width, "{left:?} then {right:?}");
+        assert_eq!((left.y, left.height), (right.y, right.height));
+    }
+    // One line runs round them all, close about them, and the control is as tall as any other.
+    let touches = |rect: &Rect| rect.y >= field.y - 2.0 && rect.y + rect.height <= field.y + field.height + 2.0;
+    let around: Vec<(Rect, f32, f32)> = lines(&mut window).into_iter().filter(|(rect, ..)| touches(rect)).collect();
+    let [(frame, _, corner)] = around[..] else { panic!("one frame: {around:?}") };
+    // The parts fill the frame, which is as wide as the people listed under it.
+    assert_eq!((field.x - frame.x, frame.x + frame.width - others.x - others.width), (1.0, 1.0), "{frame:?}");
+    let people = part(&mut window, Role::List, "Shared with");
+    assert_eq!((frame.x, frame.width), (people.x, people.width));
+    assert!((frame.height - part(&mut window, Role::Button, "Done").height).abs() < 0.5, "{frame:?}");
+
+    // The field's ring lies on the frame, corners and all. A button's ring keeps inside the button, and is
+    // round where the button has the frame's corners.
+    window.click(Role::TextInput, "Add a group").type_text("Finance");
+    let ring = |window: &mut Harness| lines(window).into_iter().find(|(rect, width, _)| touches(rect) && *width > 1.0);
+    let (on, _, round) = ring(&mut window).expect("the field's ring");
+    assert_eq!((on.x, on.y, on.height, round), (frame.x, frame.y, frame.height, corner));
+    for (button, ends) in [(add, false), (others, true)] {
+        window.key("Tab");
+        let (on, _, round) = ring(&mut window).expect("the button's ring");
+        let inside = on.x >= button.x && on.x + on.width <= button.x + button.width && on.y >= button.y;
+        assert!(inside && on.y + on.height <= button.y + button.height, "{on:?} in {button:?}");
+        assert_eq!(round > 0.0, ends, "{button:?}");
+    }
+}
+
+#[test]
+fn what_ends_the_dialog_stands_on_a_band_across_its_foot() {
+    // The band a button stands on, with room round it: it runs from side to side of the dialog, inside its
+    // line, and down to its foot.
+    let band = |window: &mut Harness, name: &str| {
+        let dialog = window.find(Role::Dialog, "Share").expect("the dialog").bounds;
+        let button = window.find(Role::Button, name).expect("the button").bounds;
+        let (right, foot) = (dialog.x + dialog.width, dialog.y + dialog.height);
+        window.paint().items.into_iter().find_map(|item| match item {
+            Item::Fill { rect, .. } if rect.height < dialog.height / 2.0 => {
+                let holds = rect.y < button.y && rect.y + rect.height > button.y + button.height;
+                let across = rect.x > dialog.x && rect.x + rect.width < right && rect.width >= dialog.width - 2.0;
+                let down = (rect.y + rect.height - foot).abs() <= 1.0;
+                (holds && across && down && rect.x + rect.width > button.x + button.width).then_some(rect)
+            }
+            _ => None,
+        })
+    };
+    let mut window = plan();
+    open(&mut window, shared(true, vec![link("l1", "Builder")]));
+    let under = band(&mut window, "Done").expect("Done stands on a band");
+    // The card's round corners cut the band's.
+    let cut = window.paint().items.into_iter().any(|item| match item {
+        Item::PushClip { rect, radius } => {
+            radius > 0.0 && rect.contains(letters_render::Point { x: under.x, y: under.y })
+        }
+        _ => false,
+    });
+    assert!(cut);
+    // What ends a link's form stands there too.
+    window.click(Role::Button, "New link");
+    assert!(band(&mut window, "Make link").is_some());
+}
+
 #[test]
 fn only_the_owner_changes_who_reaches_the_document_and_the_owner_stays() {
     let links = || vec![link("l1", "Builder")];

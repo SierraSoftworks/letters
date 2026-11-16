@@ -362,20 +362,30 @@ impl Share {
         // Who reached the document is told to whoever may share it.
         let owner = self.shared.as_ref().is_some_and(|shared| shared.owner);
         let tabs = (served && owner && self.form.is_none()).then(|| self.tabs());
-        let foot = Element::row().justify(Justify::End).gap(tokens::SPACE_SM).children(ends);
+        // What ends the dialog stands on a band across its foot.
+        let foot = Element::row()
+            .justify(Justify::End)
+            .gap(tokens::SPACE_SM)
+            .padding(Edges::xy(tokens::SPACE_XL, tokens::SPACE_MD))
+            .bg(tokens::TONE_1)
+            .children(ends);
         // What scrolls runs to the dialog's edges, so that its thumb stands clear of what it scrolls.
         let side = Edges::xy(tokens::SPACE_XL, 0.0);
         let within = |part: Element<Message>| Element::column().padding(side).child(part);
         let body = within(body).max_height((room - AROUND).max(SHORTEST)).scroll();
+        // The band runs to the card's edges, so the content is as wide as the surface is inside its line, and
+        // is cut to the surface's corners there.
         let content = Element::column()
-            .width(WIDTH)
+            .width(WIDTH - 2.0)
             .gap(tokens::SPACE_LG)
-            .padding(Edges { top: tokens::SPACE_LG, bottom: tokens::SPACE_XL, ..Edges::all(0.0) })
+            .padding(Edges::top(tokens::SPACE_LG))
+            .radius(tokens::RADIUS_CARD - 1.0)
+            .clip()
             .child(within(head))
             .children(tabs.map(within))
             .children(notice.map(within))
             .child(body)
-            .child(within(foot));
+            .child(foot);
         let dialog = Popover::new(content)
             .flush()
             .label("Share")
@@ -445,7 +455,7 @@ impl Share {
     }
 
     /// The field that takes a group's name, with the button that adds it as a reader and the menu that adds
-    /// it as something else.
+    /// it as something else: one control in one frame.
     fn adding(&self) -> Element<Message> {
         let nothing = self.group.trim().is_empty();
         let field = TextField::new(GROUP, &self.group)
@@ -464,12 +474,24 @@ impl Share {
         // Both menus hang from the dialog's right edge, and open inwards from it.
         let others =
             Button::icon_only(icon::CHEVRON_DOWN, "Add with another role").popover(others.popover().align(Align::End));
+        // Each part gives up its own line for the frame's and stands a line from the next. The parts at the
+        // ends keep the frame's corners, so the field's ring lies on the frame, and a button's ring is drawn
+        // inside it, clear of its neighbours.
+        let inside = tokens::RADIUS_CONTROL - 1.0;
+        let part = |part: Element<Message>, corner: f32| {
+            let mut part = part.height(tokens::CONTROL_HEIGHT - 2.0).radius(corner);
+            part.style.border = Edges::ZERO;
+            part
+        };
+        let line = || Element::row().width(1.0).bg(tokens::LINE_STRONG).decorative();
         Element::row()
-            .align(Align::Center)
-            .gap(tokens::SPACE_XS)
-            .child(Element::from(field).grow(1.0))
-            .child(add)
-            .child(others)
+            .border(Edges::all(1.0), tokens::LINE_STRONG)
+            .radius(tokens::RADIUS_CONTROL)
+            .child(part(Element::from(field).grow(1.0), inside))
+            .child(line())
+            .child(part(add.into(), 0.0).ring(Ring::Outline(-3.0)))
+            .child(line())
+            .child(part(others.into(), inside).ring(Ring::Outline(-3.0)))
     }
 
     /// The links made for the document, newest first.
