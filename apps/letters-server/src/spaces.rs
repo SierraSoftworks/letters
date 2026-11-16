@@ -57,13 +57,21 @@ const SYSTEM: [&str; 12] = [
     "__MACOSX",
 ];
 
+/// How the name of a file ends that a document was written out as: what the server exports, and what it
+/// imports. Beside the document of its name such a file is that document in another format.
+const WRITTEN: [&str; 6] = [".pdf", ".html", ".docx", ".md", ".markdown", ".zip"];
+
+/// Whether `name` is kept out of sight: a leading dot is how sync tools, the trash and half-written files
+/// hide, and a folder the system keeps for itself is nobody's.
+fn unseen(name: &str) -> bool {
+    name.starts_with('.') || SYSTEM.iter().any(|system| system.eq_ignore_ascii_case(name))
+}
+
 /// Whether `name` can name a file or a folder in a space: one visible name that every file system takes.
-/// A leading dot is how sync tools, the trash and half-written files hide, so none is reachable by name,
-/// and neither is a folder the system keeps for itself.
+/// Nothing kept out of sight is reachable by name.
 pub fn name_ok(name: &str) -> bool {
     let plain = !name.chars().any(|c| c.is_control() || matches!(c, '/' | '\\'));
-    let system = SYSTEM.iter().any(|system| system.eq_ignore_ascii_case(name));
-    !name.is_empty() && name.len() <= 255 && !name.starts_with('.') && plain && !system
+    !name.is_empty() && name.len() <= 255 && plain && !unseen(name)
 }
 
 /// Where something is in a space: the names of its folders and its own, joined by `/`. Empty for the
@@ -253,6 +261,16 @@ impl Folder {
         Ok(out)
     }
 
+    /// The files here and in every folder below that are no documents and belong to none, each by its path
+    /// from here, in order. A file belongs to a document when it has the document's name, is beside it, and
+    /// ends as a format the document is written out in. What is kept out of sight is not looked at.
+    pub fn strays(&self) -> io::Result<Vec<String>> {
+        let mut out = Vec::new();
+        stray(&self.dir, "", &mut out)?;
+        out.sort_by_cached_key(|path| path.to_lowercase());
+        Ok(out)
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.dir.symlink_metadata(name).is_ok()
     }
@@ -314,6 +332,38 @@ impl Folder {
         }
         copied
     }
+}
+
+/// Adds to `out` the strays of `dir` and of the folders in it, each under `under`: see [`Folder::strays`].
+fn stray(dir: &Dir, under: &str, out: &mut Vec<String>) -> io::Result<()> {
+    let (mut documents, mut others) = (Vec::new(), Vec::new());
+    for entry in dir.entries()? {
+        let entry = entry?;
+        // A name that is no text is no document's.
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = entry.file_type()?;
+        if unseen(&name) {
+            continue;
+        }
+        if kind.is_dir() {
+            stray(&entry.open_dir()?, &format!("{under}{name}/"), out)?;
+        } else if kind.is_file() && name.ends_with(EXTENSION) && name.len() > EXTENSION.len() {
+            documents.push(name);
+        } else {
+            others.push(name);
+        }
+    }
+    let written = |name: &str| {
+        WRITTEN.iter().any(|ending| {
+            let at = name.len().checked_sub(ending.len()).filter(|&at| name.is_char_boundary(at));
+            at.is_some_and(|at| {
+                name[at..].eq_ignore_ascii_case(ending)
+                    && documents.iter().any(|document| shown(document) == &name[..at])
+            })
+        })
+    };
+    out.extend(others.iter().filter(|name| !written(name)).map(|name| format!("{under}{name}")));
+    Ok(())
 }
 
 fn stamp(metadata: &cap_std::fs::Metadata) -> Stamp {

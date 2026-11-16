@@ -84,6 +84,8 @@ pub enum Ask {
     /// Where to, among the folders the person may put it in.
     Move(api::Entry, Vec<Target>),
     Trash(api::Entry),
+    /// A folder that stays out of the trash, and the files in it that keep it out.
+    Kept(api::Entry, Vec<String>),
     /// Who it is shared with, who it can be shared with besides, the links that open it, and what was
     /// done through all of them.
     Share(api::Entry, Vec<api::Grant>, Vec<api::Grantee>, Vec<Linked>, Activity),
@@ -364,14 +366,26 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool, also: &[&str]
             </AvatarGroup>
         }
     };
+    // What opens a row from its menu, which a right click shows in place of the browser's own.
+    let opens = |href: String| {
+        html! {
+            <>
+                <MenuItem icon={icons::ARROW_RIGHT} href={href.clone()}>{ "Open" }</MenuItem>
+                <MenuItem icon={icons::EXTERNAL_LINK} {href} target="_blank">{ "Open in new tab" }</MenuItem>
+            </>
+        }
+    };
+    let label = format!("More for {}", entry.name);
     let more = match &entry.id {
         Some(id) if !copy => {
             let ask = |what: &str| here.filter(|_| entry.role.edits()).map(|here| asking(here, what, id));
             let share = here.filter(|_| shares).map(|here| asking(here, "share", id));
             let export = here.map(|here| asking(here, "export", id));
             html! {
-                <MenuButton label={format!("More for {}", entry.name)} icon_only=true variant={ButtonVariant::Subtle} size={Size::Small} placement={Placement::BottomEnd}>
+                <MenuButton {label} icon_only=true variant={ButtonVariant::Subtle} size={Size::Small} placement={Placement::BottomEnd}>
+                    { opens(paths::editor_page(id)) }
                     <MenuItem icon={icons::BOOK_OPEN} href={paths::read_page(id)}>{ "Read" }</MenuItem>
+                    <MenuSeparator />
                     <MenuItem icon={icons::DOWNLOAD} href={paths::file(id)}>{ "Download" }</MenuItem>
                     if let Some(export) = export {
                         <MenuItem icon={icons::FILE_OUTPUT} href={export}>{ "Export" }</MenuItem>
@@ -390,21 +404,23 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool, also: &[&str]
         }
         // A folder is asked about by where it is. Whoever edits its space renames and moves it, and only
         // an owner of the space throws it away.
-        None if entry.kind == EntryKind::Folder => match here.filter(|_| entry.role.edits()) {
-            Some(here) => {
-                let ask = |what: &str| asking_folder(here, what, &entry.path);
-                html! {
-                    <MenuButton label={format!("More for {}", entry.name)} icon_only=true variant={ButtonVariant::Subtle} size={Size::Small} placement={Placement::BottomEnd}>
+        None if entry.kind == EntryKind::Folder && loose.is_none() => {
+            let ask =
+                here.filter(|_| entry.role.edits()).map(|here| |what: &str| asking_folder(here, what, &entry.path));
+            html! {
+                <MenuButton {label} icon_only=true variant={ButtonVariant::Subtle} size={Size::Small} placement={Placement::BottomEnd}>
+                    { opens(paths::folder_page(space, &entry.path)) }
+                    if let Some(ask) = ask {
+                        <MenuSeparator />
                         <MenuItem icon={icons::PENCIL} href={ask("rename")}>{ "Rename" }</MenuItem>
                         <MenuItem icon={icons::FOLDER_INPUT} href={ask("move")}>{ "Move" }</MenuItem>
                         if entry.role == api::Role::Owner {
                             <MenuItem icon={icons::TRASH_2} tone={Tone::Danger} href={ask("trash")}>{ "Move to trash" }</MenuItem>
                         }
-                    </MenuButton>
-                }
+                    }
+                </MenuButton>
             }
-            None => Html::default(),
-        },
+        }
         _ => Html::default(),
     };
     html! {
@@ -542,6 +558,7 @@ fn asked(ask: &Ask, here: &str) -> Html {
         Ask::Trash(entry) => (entry, format!("Move {} to the trash?", entry.name), "Move to trash", ACT_TRASH),
         Ask::Share(entry, people, offered, links, log) => return sharing(entry, people, offered, links, log, here),
         Ask::Export(entry, offers) => return exporting(entry, offers, here),
+        Ask::Kept(entry, strays) => return kept(entry, strays, here),
     };
     let fields = match ask {
         Ask::Rename(entry) => html! {
@@ -562,7 +579,7 @@ fn asked(ask: &Ask, here: &str) -> Html {
             <p>{ "Everything in it goes with it, and all of it can be put back from the trash." }</p>
         },
         Ask::Trash(_) => html! { <p>{ "It can be put back from the trash." }</p> },
-        Ask::Share(..) | Ask::Export(..) => Html::default(),
+        Ask::Share(..) | Ask::Export(..) | Ask::Kept(..) => Html::default(),
     };
     let variant = if matches!(ask, Ask::Trash(_)) { ButtonVariant::Danger } else { ButtonVariant::Primary };
     let footer = html! {
@@ -583,6 +600,28 @@ fn asked(ask: &Ask, here: &str) -> Html {
                 { hidden("back", here) }
                 { fields }
             </form>
+        </Dialog>
+    }
+}
+
+/// What is said in place of the question when a folder cannot go to the trash: the files that keep it
+/// out, the first of them by name.
+fn kept(entry: &api::Entry, strays: &[String], here: &str) -> Html {
+    const MOST: usize = 10;
+    let more = strays.len().saturating_sub(MOST);
+    html! {
+        <Dialog id="asked" open=true title={format!("{} cannot be moved to the trash", entry.name)} size={Size::Small} footer={html! {
+            <Button href={here.to_owned()} attrs={attrs! { "autofocus" => "" }}>{ "Close" }</Button>
+        }}>
+            <Stack gap={Space::Sm}>
+                <p class="lt-note">{ "It holds files that are not Letters documents. Move them out of the folder first." }</p>
+                <ul class="lt-strays" aria-label="Files that are not Letters documents">
+                    { for strays.iter().take(MOST).map(|path| html! { <li>{ path.clone() }</li> }) }
+                    if more > 0 {
+                        <li class="lt-dim">{ format!("and {more} more") }</li>
+                    }
+                </ul>
+            </Stack>
         </Dialog>
     }
 }

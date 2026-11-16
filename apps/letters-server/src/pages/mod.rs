@@ -1,7 +1,7 @@
 //! The server's own pages, for a browser: the documents a person reaches, their folders and their trash.
 //!
-//! A page is drawn where it is served, from yewi's components, and loads a stylesheet and one small script
-//! of yewi's: no wasm, so everything on it is a link or a form.
+//! A page is drawn where it is served, from yewi's components, and loads a stylesheet, one small script of
+//! yewi's and a smaller one of its own: no wasm, so everything on it is a link or a form.
 //!
 //! - [`view`] is what a page shows, and [`acts`] what its forms do.
 //! - [`statics`] is what a page loads.
@@ -146,6 +146,7 @@ async fn send(status: StatusCode, title: &str, page: Page, beyond: Option<&str>)
          <meta name=\"color-scheme\" content=\"light dark\"><title>{} · {server}</title>\
          <link rel=\"stylesheet\" href=\"{base}/fonts/fonts.css\"><link rel=\"stylesheet\" href=\"{base}/yewi.css\">\
          <link rel=\"stylesheet\" href=\"{base}/letters.css\">\
+         <script src=\"{base}/letters.js\" defer></script>\
          <link rel=\"icon\" href=\"{base}/{TAB_ICON}\" sizes=\"any\">\
          <link rel=\"apple-touch-icon\" href=\"{base}/{TOUCH_ICON}\">\
          <link rel=\"manifest\" href=\"{base}/{MANIFEST}\"></head><body>{body}</body></html>",
@@ -393,7 +394,12 @@ async fn folder(
                 (Some("rename"), Some(entry)) if edits => Some(Ask::Rename(entry)),
                 // A folder is thrown away by an owner of its space alone.
                 (Some("trash"), Some(entry)) if edits && (entry.kind != EntryKind::Folder || owns) => {
-                    Some(Ask::Trash(entry))
+                    // A folder that holds what is no document stays, and the dialog says which files.
+                    let strays = match entry.kind {
+                        EntryKind::Folder => app.strays(&who, &listing.space.id, &entry.path)?,
+                        EntryKind::Document => Vec::new(),
+                    };
+                    Some(if strays.is_empty() { Ask::Trash(entry) } else { Ask::Kept(entry, strays) })
                 }
                 (Some("move"), Some(entry)) if edits => {
                     let mut targets = targets(&app, &who, (&listing.space.id, &listing.path));

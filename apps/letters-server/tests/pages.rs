@@ -297,7 +297,8 @@ async fn a_conflict_copy_offers_its_merge_to_whoever_may_edit_and_nothing_else()
     assert!(editors.contains(ACT_MERGE) && editors.contains("Merge conflicts"), "the copy's row offers the merge");
     // The copy has the id of its original, so a link or a menu on its row would act on the original.
     let opens = format!("href=\"{}\"", paths::editor_page(&id));
-    assert_eq!(editors.matches(&opens).count(), 1, "only the original's row opens the document");
+    // The original's row opens it by its name and twice from its menu.
+    assert_eq!(editors.matches(&opens).count(), 3, "only the original's row opens the document");
     let mut guest = server.reader("guest", &["friends"]);
     let readers = page(&mut guest, &here).await;
     assert!(readers.contains(copy) && !readers.contains(ACT_MERGE), "a reader sees the copy and is offered nothing");
@@ -496,5 +497,48 @@ async fn a_page_loads_only_the_servers_own_files() {
         // Another build's address is another file's.
         let other = file.replacen("/static/", "/static/0", 1);
         assert_eq!(server.visitor().get(&other).await.status, StatusCode::NOT_FOUND, "{other}");
+    }
+}
+
+#[tokio::test]
+async fn a_folder_with_a_file_that_is_no_document_is_not_offered_to_the_trash() {
+    let server = Server::new("kept-folder");
+    let mut ben = server.reader("ben", &["parents"]);
+    let top = paths::folder_page("family", "");
+    ben.fill(ACT_NEW_FOLDER, &[("space", "family"), ("folder", ""), ("name", "House")]).await;
+    std::fs::write(server.scratch.0.join("family/House/notes.txt"), b"kept").unwrap();
+
+    // The question names the file and offers no way to throw the folder away, and neither does the form.
+    let ask = asking_folder(&top, "trash", "House");
+    let asked = page(&mut ben, &ask).await;
+    assert!(asked.contains("notes.txt") && !asked.contains(&format!("action=\"{ACT_TRASH}\"")), "the file is named");
+    let about = [("space", "family"), ("folder", "House"), ("back", top.as_str())];
+    assert_eq!(ben.fill(ACT_TRASH, &about).await.location(), ask, "the form leads back to what keeps it");
+    assert_eq!(names(&listed(&ben, "family", "").await), ["House"], "the folder stays");
+
+    std::fs::remove_file(server.scratch.0.join("family/House/notes.txt")).unwrap();
+    assert!(page(&mut ben, &ask).await.contains(&format!("action=\"{ACT_TRASH}\"")), "without it, it is asked");
+}
+
+#[tokio::test]
+async fn a_row_has_a_menu_that_a_right_click_opens() {
+    let server = Server::new("row-menu");
+    let (mut ben, mut guest) = (server.reader("ben", &["family"]), server.reader("guest", &["friends"]));
+    let top = paths::folder_page("family", "");
+    ben.fill(ACT_NEW_FOLDER, &[("space", "family"), ("folder", ""), ("name", "House")]).await;
+    let id = ben.pages().start("family", "", "Plan").await.id.unwrap();
+    // Whoever only reads has the menu too: it opens the row.
+    for reader in [&mut ben, &mut guest] {
+        let shown = page(reader, &top).await;
+        for (name, href) in [("House", paths::folder_page("family", "House")), ("Plan", paths::editor_page(&id))] {
+            assert!(shown.contains(&format!("More for {name}")), "{name} has a menu");
+            assert!(shown.matches(&format!("href=\"{href}\"")).count() >= 2, "{name}: the menu opens it");
+        }
+        // The script that opens the menu at the pointer is the server's own, and is served.
+        let script =
+            shown.split("src=\"").find_map(|rest| rest.split('"').next().filter(|src| src.ends_with("letters.js")));
+        let script = reader.get(script.expect("the page loads the script")).await;
+        assert_eq!(script.status, StatusCode::OK);
+        assert!(script.text().contains("contextmenu"));
     }
 }
