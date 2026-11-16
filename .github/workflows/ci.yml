@@ -146,8 +146,12 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     env:
       SERVER_TARGET: x86_64-unknown-linux-musl
+      SERVER_IMAGE: ghcr.io/sierrasoftworks/letters-server
     steps:
       - uses: actions/checkout@v7
 
@@ -204,6 +208,22 @@ jobs:
           path = '$RUNNER_TEMP/home/{username}'
           EOF
           "target/$SERVER_TARGET/server/letters-server" --check --config "$RUNNER_TEMP/letters.toml"
+
+      # The image a deployment pulls: the file that was just checked, and the runner's roots. `latest` is
+      # main as it last built, and each build keeps its commit's name.
+      - name: Publish the image
+        if: github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir "$RUNNER_TEMP/image"
+          cp "target/$SERVER_TARGET/server/letters-server" /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/image/"
+          docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin <<<"$GHCR_TOKEN"
+          docker build --file apps/letters-server/Dockerfile \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$SERVER_IMAGE:latest" --tag "$SERVER_IMAGE:$GITHUB_SHA" "$RUNNER_TEMP/image"
+          docker push --all-tags "$SERVER_IMAGE"
 
   # What layout costs a frame. The bench holds its own budgets and fails when a measurement is over one.
   bench:
