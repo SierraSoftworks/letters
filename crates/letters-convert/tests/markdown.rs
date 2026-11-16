@@ -206,6 +206,8 @@ fn reads_maths() {
         ("$$\na &= b \\\\\n  &= c\n$$", &[r#"formula "a &= b \\\\\n  &= c""#]),
         ("```math\nx^2\n```", &[r#"formula "x^2""#]),
         ("where\n$$\nx^2\n$$\nholds", &[r#"p "where""#, r#"formula "x^2""#, r#"p "holds""#]),
+        // Markdown drops these at the edges of a paragraph, so the text beside a formula loses them too.
+        ("where\n\u{b}$$\nx^2\n$$\n\u{c}holds\u{b}", &[r#"p "where""#, r#"formula "x^2""#, r#"p "holds""#]),
         ("- step\n  $$\n  x^2\n  $$\n- next", &[r#"bullet/0 "step""#, r#"formula "x^2""#, r#"bullet/0 "next""#]),
         ("> $$x^2$$", &["quote", r#"  formula "x^2""#]),
         ("# On $$x^2$$", &[r#"h1 "On <math|x^2>""#]),

@@ -532,8 +532,8 @@ impl DocLayout {
         self.state.borrow_mut().printed(|state| state.outline(pages))
     }
 
-    /// The position nearest to a point: in the nearest text, or on a picture of a gallery. `None` when the
-    /// document holds neither.
+    /// The position nearest to a point: in the nearest text, on a picture of a gallery, or on the empty box
+    /// of a gallery or a table that holds nothing, at offset 0. `None` when the document holds none of these.
     ///
     /// Past the end of a line that wraps, this is the last place that is on that line alone: before the space
     /// it wraps at, or before its last character when it wraps with no space. To put a caret, use

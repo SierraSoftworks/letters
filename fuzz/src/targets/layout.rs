@@ -1,8 +1,8 @@
 //! Any document on the screen and on paper: it is laid out at any width, painted, paged and hit tested, and
-//! every place layout names is a place in the text.
+//! every place layout names is a place in the text or an empty box.
 
 use letters_layout::{DocLayout, Fonts};
-use letters_model::{Body, Document, Pos, Selection};
+use letters_model::{BlockKind, Body, Document, Pos, Selection};
 use letters_render::{DisplayList, Point, Rect};
 
 use crate::edits::{written, written_seeds};
@@ -12,10 +12,14 @@ const WIDTHS: [f32; 6] = [0.0, 1.0, 37.5, 320.0, 720.0, 2400.0];
 /// How many times idle layout is asked to go on. Far more than a bounded input needs.
 const IDLE: usize = 4096;
 
-/// Fails unless `pos` is between two characters of a block of text.
+/// Fails unless `pos` is between two characters of a block of text, or on the empty box layout draws for a
+/// gallery or a table that holds nothing.
 fn on_text(doc: &Document, pos: &Pos, from: &str) {
-    let block = doc.block(&pos.block).filter(|block| matches!(block.body, Body::Text(_)));
-    let on = block.is_some_and(|block| block.plain_text().is_char_boundary(pos.offset));
+    let on = doc.block(&pos.block).is_some_and(|block| match &block.body {
+        Body::Text(_) => block.plain_text().is_char_boundary(pos.offset),
+        Body::Blocks(_) => matches!(block.kind, BlockKind::Gallery { .. } | BlockKind::Table { .. }) && pos.offset == 0,
+        Body::None => false,
+    });
     assert!(on, "{from} names {pos:?}, which is no place in the text");
 }
 

@@ -806,9 +806,10 @@ pub(crate) fn nest(blocks: &mut [Block]) {
     }
 }
 
-/// Drops the spaces and line breaks at the edges of a block's text.
+/// Drops the spaces and line breaks at the edges of a block's text: all that Markdown drops at the edges of
+/// a paragraph, or the text would lose them on its way through a file.
 pub(crate) fn trim(runs: &mut Vec<Run>) {
-    const EDGE: [char; 3] = [' ', '\t', '\n'];
+    const EDGE: [char; 5] = [' ', '\t', '\n', '\u{b}', '\u{c}'];
     let blank = |run: &Run| run.text.trim_matches(EDGE).is_empty();
     runs.truncate(runs.len() - runs.iter().rev().take_while(|run| blank(run)).count());
     runs.drain(..runs.iter().take_while(|run| blank(run)).count());

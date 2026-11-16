@@ -11,7 +11,7 @@ pub struct Folder {
     /// When each file last changed, on a clock that ticks once per change.
     modified: BTreeMap<String, u64>,
     clock: u64,
-    /// Renames onto this name are refused, as a file held open on SMB refuses them.
+    /// Renames of this file and onto it are refused, as a file held open on SMB refuses both.
     pub locked: Option<String>,
     /// Put in place of this file just after the next write: another writer slipping in mid-save.
     pub racing: Option<(String, Vec<u8>)>,
@@ -44,7 +44,7 @@ impl Files for Folder {
     }
 
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
-        if self.locked.as_deref() == Some(to) {
+        if self.locked.as_deref().is_some_and(|locked| locked == to || locked == from) {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file is in use"));
         }
         let bytes = self.files.remove(from).ok_or(io::ErrorKind::NotFound)?;
