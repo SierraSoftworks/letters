@@ -4,6 +4,7 @@
 use letters_api::{
     Access as Reach, Action, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role as Grade, Shares, Via, Who,
 };
+use letters_render::{Item, Rect};
 use letters_test::{Found, Harness, Role};
 use letters_ui::{Access, Connection, Request, Shared};
 
@@ -11,6 +12,8 @@ use letters_ui::{Access, Connection, Request, Shared};
 const NOON: u64 = 1_794_744_000;
 const DAY: u64 = 86_400;
 const REFUSAL: &str = "Only the owner says who this document is shared with.";
+/// A name that no row has the room for.
+const LONG: &str = "Alexandria Featherstonehaugh-Cholmondeley of the Harland Roofing and Guttering Company";
 
 /// A plan that a server keeps, in a window whose clock says noon.
 fn plan() -> Harness {
@@ -74,6 +77,17 @@ fn button(window: &mut Harness, name: &str, about: &str) -> Option<Found> {
     let is =
         |found: &Found| found.role == Role::Button && found.name == name && found.description.as_deref() == Some(about);
     window.controls().into_iter().find(is)
+}
+
+/// The dialog's place in the window, and how far right the letters written in it reach: where the last
+/// letter of any run that starts there stands.
+fn written(window: &mut Harness) -> (Rect, f32) {
+    let dialog = window.find(Role::Dialog, "Share").expect("the dialog").bounds;
+    let ends = window.paint().items.into_iter().filter_map(|item| match item {
+        Item::Glyphs { origin, glyphs, .. } if dialog.contains(origin) => glyphs.last().map(|last| origin.x + last.x),
+        _ => None,
+    });
+    (dialog, ends.fold(0.0, f32::max))
 }
 
 /// Something a test does to the window.
@@ -208,6 +222,37 @@ fn the_controls_of_the_roles_line_up_whatever_role_each_says() {
     };
     let (editor, commenter) = (wide(&mut window, "Ben Price"), wide(&mut window, "Family"));
     assert!((editor - commenter).abs() < 0.5, "an editor's is {editor} wide and a commenter's {commenter}");
+}
+
+#[test]
+fn a_name_too_long_for_its_row_is_cut_short_inside_the_dialog() {
+    let mut window = plan();
+    let friends = format!("{LONG} and friends");
+    let people = vec![
+        person("p1", "Alice Martin", Grade::Owner),
+        person("p2", LONG, Grade::Editor),
+        group(&friends, Grade::Reader),
+    ];
+    let shares = Shares { people, links: vec![link("l1", LONG)] };
+    open(&mut window, Shared { shares, owner: true, links: true });
+    let (dialog, ends) = written(&mut window);
+    let edge = dialog.x + dialog.width;
+    assert!(ends < edge, "the names and the link's label end at {ends}, in {dialog:?}");
+    // What stands at the end of a row keeps its place.
+    for name in [LONG, friends.as_str()] {
+        let role = window.find(Role::Button, &format!("Role of {name}")).expect("a control for the role").bounds;
+        assert!(role.x + role.width < edge, "{name}: {role:?} in {dialog:?}");
+    }
+    let revoke = button(&mut window, "Revoke", &format!("The link for {LONG}")).expect("a way to revoke it").bounds;
+    assert!(revoke.x + revoke.width < edge, "{revoke:?} in {dialog:?}");
+
+    // So it is in the log, of someone and of the link they came by.
+    window.click(Role::Tab, "Activity");
+    window.ui().take_requests();
+    let via = Some(Via { id: "l1".into(), label: LONG.into() });
+    window.ui().set_access_log(vec![Reach { link: via, ..reach(HOUR, by(LONG), Action::Edit, Grade::Editor) }]);
+    let (dialog, ends) = written(&mut window);
+    assert!(ends < dialog.x + dialog.width, "the log's letters end at {ends}, in {dialog:?}");
 }
 
 #[test]

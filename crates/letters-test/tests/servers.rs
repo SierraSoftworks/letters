@@ -75,6 +75,17 @@ fn the_dialog_lists_where_the_person_is_signed_in_and_signs_them_out() {
 }
 
 #[test]
+fn an_address_or_a_name_too_long_for_its_row_is_cut_short_inside_the_dialog() {
+    let address = "https://letters.a-very-long-subdomain-for-the-family.documents.example.org";
+    let account = "Alexandria Featherstonehaugh-Cholmondeley of the Harland Roofing and Guttering Company";
+    let mut window = signed_in(vec![server(address, account)]);
+    open(&mut window);
+    let dialog = window.find(Role::Dialog, "Servers").expect("the dialog").bounds;
+    let out = window.find(Role::Button, "Sign out").expect("the way out").bounds;
+    assert!(out.x + out.width < dialog.x + dialog.width, "{out:?} in {dialog:?}");
+}
+
+#[test]
 fn the_keyboard_stays_in_the_dialog_when_the_row_it_was_on_goes() {
     let mut window = signed_in(vec![server(HOME, "Sam Okafor")]);
     open(&mut window);

@@ -50,6 +50,8 @@ impl<M> From<Segmented<M>> for Element<M> {
             .border(Edges::all(1.0), tokens::LINE)
             .radius(tokens::RADIUS_CONTROL)
             .bg(well)
+            // Choices too long for the room they are given are cut short, each in its own segment.
+            .shrink()
             .role(Role::RadioGroup)
             .label(control.label);
         for (label, chosen, message) in control.segments {
@@ -62,10 +64,11 @@ impl<M> From<Segmented<M>> for Element<M> {
                 .fg(if chosen { tokens::FG } else { tokens::FG_MUTED })
                 .hover(Look::NONE.with_fg(tokens::FG))
                 .ring(Ring::Outline(1.0))
+                .shrink()
                 .role(Role::RadioButton)
                 .label(label.as_str())
                 .checked(chosen)
-                .child(Element::text(label, style).decorative())
+                .child(Element::text(label, style).shrink().decorative())
                 .on_press(message);
             if chosen {
                 segment = segment.bg(tokens::SURFACE_RAISED).shadow(tokens::SHADOW_CARD);

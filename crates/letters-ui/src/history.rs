@@ -2039,14 +2039,14 @@ impl History {
         let head = Element::row()
             .align(Align::Center)
             .min_height(HEAD)
+            .shrink()
             .child(Element::text(line.title.as_str(), small).shrink());
-        let mut body =
-            Element::column().grow(1.0).gap(tokens::SPACE_2XS).padding(Edges::xy(0.0, tokens::SPACE_SM)).child(head);
+        let mut body = Self::lines(head);
         let by = line.by(version);
         if !by.is_empty() {
             let face = version.authors.first().map(|(name, _)| threads::face(name, false));
             let said = Element::text(by.join(" \u{b7} "), small).fg(tokens::FG_MUTED).shrink();
-            let said = Element::row().align(Align::Center).gap(tokens::SPACE_SM).children(face).child(said);
+            let said = Element::row().align(Align::Center).gap(tokens::SPACE_SM).shrink().children(face).child(said);
             body = body.child(said.height(threads::FACE));
         }
         // The passage as it read, which a press on goes through to the row.
@@ -2117,6 +2117,13 @@ impl History {
         if line.picked { row.bg(accent().soft) } else { row }
     }
 
+    /// The lines of a row of the panel, under its `head`. What is too long for the panel, a version's
+    /// name or a writer's, is cut short in it.
+    fn lines(head: Element<Message>) -> Element<Message> {
+        let lines = Element::column().grow(1.0).shrink().gap(tokens::SPACE_2XS);
+        lines.padding(Edges::xy(0.0, tokens::SPACE_SM)).child(head)
+    }
+
     /// One version in the panel: its marker on the day's rail, what it is listed as, who wrote it and how
     /// much it changed. `ends` says whether it is the first and the last of its day.
     fn row(versions: &[Version], at: usize, picked: bool, (first, last): (bool, bool), zone: i32) -> Element<Message> {
@@ -2132,6 +2139,7 @@ impl History {
             .align(Align::Center)
             .gap(tokens::SPACE_SM)
             .min_height(HEAD)
+            .shrink()
             .child(Element::text(title.as_str(), small).shrink())
             .child(Element::spacer());
         if version.name().is_some() {
@@ -2151,13 +2159,12 @@ impl History {
             let taken_out = Element::text(format!("\u{2212}{}", count(version.removed)), figures).fg(TONES[0].1);
             head = head.child(Element::row().gap(tokens::SPACE_XS).child(put_in).child(taken_out).decorative());
         }
-        let mut body =
-            Element::column().grow(1.0).gap(tokens::SPACE_2XS).padding(Edges::xy(0.0, tokens::SPACE_SM)).child(head);
+        let mut body = Self::lines(head);
         let by: Vec<&str> = [who.as_deref(), when.as_deref()].into_iter().flatten().collect();
         if !by.is_empty() {
             let face = version.authors.first().map(|(name, _)| threads::face(name, false));
             let by = Element::text(by.join(" \u{b7} "), small).fg(tokens::FG_MUTED).shrink();
-            let by = Element::row().align(Align::Center).gap(tokens::SPACE_SM).children(face).child(by);
+            let by = Element::row().align(Align::Center).gap(tokens::SPACE_SM).shrink().children(face).child(by);
             // As tall with a face as without, so that the row's height is known before it is built.
             body = body.child(by.height(threads::FACE));
         }

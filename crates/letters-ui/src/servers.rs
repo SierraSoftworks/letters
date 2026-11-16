@@ -259,8 +259,10 @@ fn server(server: &Server) -> Element<Message> {
         .child(Element::icon(icon::CLOUD, 16.0))
         .decorative();
     let account = format!("Signed in as {}", server.account);
+    // An address or a name too long for the row is cut short, and the way out keeps its place.
     let names = Element::column()
         .grow(1.0)
+        .shrink()
         .child(Element::text(name, TextStyle::control().weight(600)).shrink())
         .child(Element::text(account.as_str(), quiet()).fg(tokens::FG_MUTED).shrink());
     let out = Button::new("Sign out").small().on_press(send(Signing::Out(server.address.clone())));

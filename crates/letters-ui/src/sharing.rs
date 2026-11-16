@@ -489,14 +489,17 @@ impl Share {
 
     /// A link's card. Its limits were fixed when it was made, so they read as labels and not as controls.
     fn link(&self, link: &Link, owner: bool) -> Element<Message> {
+        // A label too long for the card is cut short: the day and the buttons keep their room.
+        let label = Element::text(link.label.as_str(), TextStyle::control().size(tokens::TEXT_SM).weight(600));
         let tag = Element::row()
             .align(Align::Center)
             .gap(tokens::SPACE_XS)
             .padding(Edges::xy(tokens::SPACE_SM, 2.0))
             .border(Edges::all(1.0), tokens::LINE_STRONG)
             .radius(tokens::RADIUS_SM)
+            .shrink()
             .child(Element::icon(icon::LINK, 14.0).fg(tokens::FG_MUTED))
-            .child(Element::text(link.label.as_str(), TextStyle::control().size(tokens::TEXT_SM).weight(600)));
+            .child(label.shrink());
         let made = format!("Made {}", dated(link.created, self.now, self.zone));
         let mut top = Element::row()
             .align(Align::Center)
@@ -623,7 +626,9 @@ fn person(at: usize, grant: &Grant, owner: bool) -> Element<Message> {
         .child(Element::text(initials(name), TextStyle::control().size(tokens::TEXT_SM).weight(600)))
         .decorative();
     let detail = group.then(|| Element::text("Group", quiet()).fg(tokens::FG_MUTED));
-    let who = Element::column().grow(1.0).child(Element::text(name, TextStyle::control().weight(500))).children(detail);
+    // A name too long for the row is cut short, so that its role stays in line with the others.
+    let said = Element::text(name, TextStyle::control().weight(500)).shrink();
+    let who = Element::column().grow(1.0).shrink().child(said).children(detail);
     // An owner's row stays as it is, and only the owner changes another's.
     let role = match owner && !grant.role.shares() {
         true => choose(at, name, grant.role),

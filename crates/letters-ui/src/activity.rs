@@ -111,12 +111,14 @@ fn entry(reach: &Reach, zone: i32, joined: bool) -> Element<Message> {
             .padding(Edges::xy(tokens::SPACE_SM, 2.0))
             .border(Edges::all(1.0), tokens::LINE_STRONG)
             .radius(tokens::RADIUS_SM)
+            .shrink()
             .child(Element::icon(icon::LINK, 14.0).fg(tokens::FG_MUTED))
-            .child(Element::text(label, quiet().weight(600)))
+            .child(Element::text(label, quiet().weight(600)).shrink())
     });
     let meta = Element::row()
         .align(Align::Center)
         .gap(tokens::SPACE_SM)
+        .shrink()
         .child(cap(reach.role))
         .children(via)
         .child(Element::text(from.as_str(), quiet()).fg(tokens::FG_MUTED).shrink());
@@ -135,7 +137,8 @@ fn entry(reach: &Reach, zone: i32, joined: bool) -> Element<Message> {
         .label(format!("{who} {did}"))
         .description(rest.join(", "))
         .child(side)
-        .child(Element::column().grow(1.0).gap(tokens::SPACE_2XS).child(title).child(meta))
+        // What is too long for the row is cut short, and the time keeps its place at the row's end.
+        .child(Element::column().grow(1.0).shrink().gap(tokens::SPACE_2XS).child(title).child(meta))
         .child(Element::text(when.as_str(), quiet()).fg(tokens::FG_MUTED))
 }
 

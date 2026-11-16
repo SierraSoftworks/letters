@@ -1389,7 +1389,15 @@ impl<A: App> Ui<A> {
     /// Returns whether a popover was closed.
     fn fold(&mut self) -> bool {
         if self.focused().is_some_and(|i| self.tree.gone(i)) {
-            self.focus = self.rest();
+            // A field that asked for the keyboard in a form of a bar that does not fit hands it to the same
+            // field in the form that does, ready to be typed over as it was.
+            let tree = &self.tree;
+            let heir = (0..tree.nodes.len()).find(|&i| tree.nodes[i].el.takes_focus && tree.focusable(i));
+            let heir = heir.map(|i| &tree.nodes[i]);
+            if let Some(field) = heir.filter(|node| matches!(node.el.content, Content::Input(_))) {
+                self.inputs.entry(field.id).or_default().select_all();
+            }
+            self.focus = heir.map(|node| node.id).or_else(|| self.rest());
         }
         let tree = &self.tree;
         let before = self.open.len();

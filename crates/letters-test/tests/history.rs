@@ -1632,3 +1632,50 @@ fn a_history_that_is_out_goes_when_the_shell_keeps_it_back() {
         assert!(window.focused().is_some_and(|found| found.role == Role::Document), "{what}: the page is back");
     }
 }
+
+#[test]
+fn a_version_is_named_in_a_window_too_narrow_for_the_whole_bar() {
+    let mut window = letter();
+    window.resize(700.0, 800.0);
+    // The bar is folded, and the field that comes out where its button stood has the keyboard all the same.
+    window.click(Role::Button, "History").click(Role::ListBoxOption, "16:42").click(Role::Button, "Name");
+    window.type_text("Sent to the roofer").key("Enter");
+    assert_eq!(picked(&mut window).as_deref(), Some("Sent to the roofer"));
+    // A name it has is there to be typed over.
+    window.click(Role::Button, "Name").type_text("Final").key("Enter");
+    assert_eq!(picked(&mut window).as_deref(), Some("Final"));
+}
+
+#[test]
+fn a_name_too_long_for_the_panel_is_cut_short_in_it() {
+    const LONG: &str = "Alexandria Featherstonehaugh-Cholmondeley of the Harland Roofing and Guttering Company";
+    let mut window = Harness::doc("# Cottage renovation\n\nThe roof comes first.");
+    window.ui().set_author(LONG);
+    write(&mut window, SUNDAY - 5 * DAY + 11 * HOUR, "roof", "north roof");
+    write(&mut window, SUNDAY + 9 * HOUR, "first", "first of all");
+    window.platform.wall = Some(SUNDAY + 9 * HOUR + 20 * MINUTE);
+    // How far right the letters written in a panel reach, and where the panel ends.
+    let reach = |window: &mut Harness, panel: &str| {
+        let panel = window.find(Role::Complementary, panel).expect("the panel").bounds;
+        let ends = window.paint().items.into_iter().filter_map(|item| match item {
+            Item::Glyphs { origin, glyphs, .. } if panel.contains(origin) => {
+                glyphs.last().map(|last| origin.x + last.x)
+            }
+            _ => None,
+        });
+        (ends.fold(0.0, f32::max), panel.x + panel.width)
+    };
+
+    // A writer's name, and a version's.
+    window.click(Role::Button, "History");
+    let earlier = versions(&mut window)[1].name.clone();
+    window.click(Role::ListBoxOption, &earlier).click(Role::Button, "Name");
+    window.type_text(LONG).key("Enter");
+    assert_eq!(picked(&mut window).as_deref(), Some(LONG));
+    let (ends, edge) = reach(&mut window, "History");
+    assert!(ends < edge, "the letters end at {ends}, the panel at {edge}");
+
+    window.key("Escape").select("north").key("Mod+Shift+P").type_text("History of selection").key("Enter");
+    let (ends, edge) = reach(&mut window, "History of selection");
+    assert!(ends < edge, "a passage's: the letters end at {ends}, the panel at {edge}");
+}

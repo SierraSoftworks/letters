@@ -234,6 +234,18 @@ fn what_is_too_long_for_a_row_is_cut_short_inside_the_card() {
 }
 
 #[test]
+fn servers_with_long_addresses_are_chosen_between_inside_the_card() {
+    let home = "https://letters.a-very-long-subdomain-for-the-family.documents.example.org";
+    let work = "https://documents.the-northern-slate-quarry-cooperative.example.net";
+    let mut window = signed_in(&[home, work]);
+    window.click(Role::Button, "More").click(Role::MenuItem, "Open");
+    let card = window.find(Role::Dialog, "Open").expect("the card").bounds;
+    // Each is cut short where it is chosen, and the way to this device's files keeps its place beside them.
+    let device = window.find(Role::Button, "This device").expect("the way to a file on this device").bounds;
+    assert!(device.x + device.width < card.x + card.width, "{device:?} in {card:?}");
+}
+
+#[test]
 fn a_document_that_is_pressed_is_opened_and_the_card_goes() {
     let mut window = signed_in(&[HOME]);
     let editing = Tag::Editing { people: vec!["Alice Moreau".into()] };
