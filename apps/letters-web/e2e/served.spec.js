@@ -91,10 +91,11 @@ for (const { name, answer, held, told } of answers) {
   });
 }
 
-test("someone a share link alone leads in keeps the document as it stands, without what it once read", async ({ page }) => {
+test("someone a share link alone leads in is shown no history, and keeps the document as it stands without it", async ({ page }) => {
   const files = [];
   for (const by_link of [false, true]) {
     await serve(page, opened({ by_link }));
+    await expect(page.getByRole("button", { name: "History", exact: true })).toBeAttached({ attached: !by_link });
     // A passage written and taken back is in the history alone.
     await page.keyboard.type("A passage that is written and then taken back, which only the history remembers. ".repeat(4));
     await page.keyboard.press("ControlOrMeta+z");

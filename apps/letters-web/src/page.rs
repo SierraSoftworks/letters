@@ -484,6 +484,8 @@ pub fn served_on(model: Model, opened: &Opened) -> Window {
     // What a share link withholds is not offered.
     let Allows { download, copy, print } = opened.allows;
     window.set_allows(letters_ui::Allows { copy, download, print });
+    // Nor is the document's past shown to one a share link alone leads in.
+    window.set_history_shown(!opened.by_link);
     window
 }
 
