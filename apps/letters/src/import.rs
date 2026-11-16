@@ -104,7 +104,11 @@ impl Imported {
     pub fn keep(&self, folder: &Path, name: &str) -> io::Result<PathBuf> {
         let mut bytes = io::Cursor::new(Vec::new());
         letters_format::write(&mut bytes, &self.package).map_err(io::Error::other)?;
-        fs::create_dir_all(folder)?;
+        // A file where the folder should be: Windows says its name is taken, which reads as the document's.
+        fs::create_dir_all(folder).map_err(|error| match error.kind() {
+            io::ErrorKind::AlreadyExists => io::ErrorKind::NotADirectory.into(),
+            _ => error,
+        })?;
         // A name that was free may be taken by the time it is written: the next one is tried then.
         for _ in 0..8 {
             let path = free_path(folder, name);
