@@ -638,6 +638,8 @@ struct DocWindow {
     cursor: Cursor,
     /// Whether the window has been offered the GPU. It is offered once, after its first frame.
     gpu_offered: bool,
+    /// Where the window writes its words for a test to read. See [`SAYS`].
+    says: Option<PathBuf>,
     /// Whether the accessibility tree is behind the view, and whether it must be told again in full.
     access_stale: bool,
     access_whole: bool,
@@ -1387,7 +1389,14 @@ impl DocWindow {
                 },
             });
         }
-        if std::mem::take(&mut self.access_stale) {
+        if let Some(file) = &self.says {
+            // Whole each time, and to assistive technology too: a test is in no hurry.
+            let tree = self.view.access();
+            let said = tree.nodes.iter().flat_map(|(_, node)| [node.label(), node.value()]).flatten();
+            say(file, &said.collect::<Vec<_>>().join("\n"));
+            (self.access_stale, self.access_whole) = (false, false);
+            self.access.update_if_active(|| tree);
+        } else if std::mem::take(&mut self.access_stale) {
             // Assistive technology that has just started is told everything, and after that what changed.
             let (view, whole) = (&mut self.view, &mut self.access_whole);
             self.access.update_if_active(|| if std::mem::take(whole) { view.access() } else { view.access_changes() });
@@ -2162,6 +2171,20 @@ impl DocWindow {
     }
 }
 
+/// The variable that names a file for a window to write its words to, a line for each thing it names
+/// or holds, as assistive technology hears them. For a test that drives a real window and has to read
+/// what it shows. The file holds the document's text, so nothing is written unless it is set.
+pub const SAYS: &str = "LETTERS_SAYS";
+
+/// Writes what a window says beside `file` and moves it there, so that a reader finds all of it or the
+/// words before.
+fn say(file: &Path, said: &str) {
+    let beside = file.with_extension("new");
+    if let Err(error) = fs::write(&beside, said).and_then(|()| fs::rename(&beside, file)) {
+        eprintln!("letters: could not write what the window says: {error}");
+    }
+}
+
 fn alert(parent: Option<&Arc<Window>>, message: &str) {
     eprintln!("letters: {message}");
     let dialog = MessageDialog::new().set_level(MessageLevel::Error).set_title("Letters").set_description(message);
@@ -2227,6 +2250,7 @@ impl App {
             pointer: Point::default(),
             cursor: Cursor::Default,
             gpu_offered: false,
+            says: std::env::var_os(SAYS).map(PathBuf::from),
             access_stale: false,
             access_whole: true,
             chrome: Chrome::default(),

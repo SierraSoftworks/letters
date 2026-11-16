@@ -26,10 +26,12 @@ wasm() {
 }
 
 # The tests `cargo test` leaves out (#[ignore]) because a debug build takes minutes over them, or because
-# they need a session bus. CI runs them each night. They are named, since other ignored tests rewrite
-# files of the repository. Not one of the steps a bare `./scripts/check.sh` runs.
+# they need a session bus or a display. CI runs them each night. They are named, since other ignored tests
+# rewrite files of the repository. Not one of the steps a bare `./scripts/check.sh` runs.
 slow() {
   dbus-run-session -- cargo test --release -p letters --test chrome --test letters_server -- --ignored
+  # The app in a real window, typed into with xdotool, on a display in memory.
+  xvfb-run -a -s "-screen 0 1400x1000x24" cargo test --release -p letters --test window -- --ignored
 }
 
 [ $# -gt 0 ] || set -- fmt lint test wasm

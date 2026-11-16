@@ -129,8 +129,11 @@ jobs:
           key: slow
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install a session bus
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends dbus-daemon
+      # The window tests type into a real window, on a display in memory.
+      - name: Install a session bus and a display
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends dbus-daemon xvfb xauth libxkbcommon-x11-0 xdotool
 
       - name: Test
         run: ./scripts/check.sh slow
