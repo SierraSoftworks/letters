@@ -6,6 +6,7 @@
 //! - [`Token`] and [`Person`] are a session. A browser holds it in a cookie, the desktop app as a bearer.
 //! - [`Space`], [`Listing`] and [`Entry`] are the documents a person reaches, and [`Opened`] one of them
 //!   ready to edit.
+//! - [`Query`] finds entries by what a person types, the same on the server and in a shell.
 //! - [`Shares`], [`Link`] and [`Access`] are who else reaches a document, and who did.
 //! - [`Error`] is every refusal: a [`Code`] to act on and a sentence to show.
 //!
@@ -17,6 +18,7 @@
 mod documents;
 mod error;
 pub mod paths;
+mod search;
 mod session;
 mod sharing;
 
@@ -25,6 +27,7 @@ pub use documents::{
     SpaceKind, Tag, Trashed, Trust,
 };
 pub use error::{Code, Error};
+pub use search::Query;
 pub use session::{Appearance, Exchange, Limits, Person, Renewal, Server, Settings, Token};
 pub use sharing::{Access, Action, Allows, CreatedLink, Grant, Grantee, Link, NewLink, Role, Shares, Via, Who};
 

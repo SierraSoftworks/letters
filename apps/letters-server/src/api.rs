@@ -184,13 +184,22 @@ struct InFolder {
     path: String,
 }
 
+#[derive(Deserialize)]
+struct Listed {
+    #[serde(default)]
+    path: String,
+    /// Everything under the folder, in whatever folder of it.
+    #[serde(default)]
+    deep: bool,
+}
+
 async fn entries(
     State(app): State<Shared>,
     who: Signed,
     Path(space): Path<String>,
-    Query(at): Query<InFolder>,
+    Query(at): Query<Listed>,
 ) -> Answer<Json<Listing>> {
-    blocking(move || app.listing(&who, &space, &at.path).map(Json)).await
+    blocking(move || app.listing(&who, &space, &at.path, at.deep).map(Json)).await
 }
 
 async fn new_document(
@@ -579,16 +588,36 @@ impl App {
         Ok(Found { space: None, role, allows, until: Some(linked.ends), root, place })
     }
 
-    pub fn listing(&self, who: &Signed, space: &str, folder: &str) -> Answer<Listing> {
+    /// What the folder at `folder` of a space holds. A `deep` listing goes on with what each folder in it
+    /// holds, down to the last, for a shell to search the space in.
+    pub fn listing(&self, who: &Signed, space: &str, folder: &str, deep: bool) -> Answer<Listing> {
         let (space, role) = self.space(who, space)?;
         let (root, place) = (self.root(who, space)?, Place::parse(folder)?);
         let told = space.told(role);
-        let rows = self.library.list(&self.store, &root, &place)?;
-        let mut entries: Vec<Entry> = rows.iter().map(|row| self.told(who, placed(&told, row), &root, row)).collect();
+        let mut entries = self.held(who, &told, &root, &place)?;
+        let mut read = 0;
+        while deep && read < entries.len() {
+            let folders: Vec<String> = entries[read..]
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Folder)
+                .map(|entry| entry.path.clone())
+                .collect();
+            read = entries.len();
+            // A folder that cannot be read, or went away meanwhile, holds nothing to find.
+            let held = |at: &String| self.held(who, &told, &root, &Place::parse(at).ok()?).ok();
+            entries.extend(folders.iter().filter_map(held).flatten());
+        }
+        Ok(Listing { space: told, path: place.as_str().to_owned(), entries })
+    }
+
+    /// What one folder of a space holds, as a file table of the space shows it.
+    fn held(&self, who: &Signed, told: &Space, root: &Root, place: &Place) -> Answer<Vec<Entry>> {
+        let rows = self.library.list(&self.store, root, place)?;
+        let mut entries: Vec<Entry> = rows.iter().map(|row| self.told(who, placed(told, row), root, row)).collect();
         // What could be a document and is none yet is listed among the documents, and under the document
         // of its name where there is one: the same writing in another format.
         let mut under = Vec::new();
-        for file in root.folder(&place)?.loose()? {
+        for file in root.folder(place)?.loose()? {
             let stem = unimported(&file.name).unwrap_or_default();
             let read = |row: &Row| row.known.as_ref().is_some_and(|known| known.id.is_some());
             let beside = rows.iter().find(|row| !row.listed.folder && read(row) && shown(&row.listed.name) == stem);
@@ -600,7 +629,7 @@ impl App {
                 id: None,
                 created: None,
                 modified: seconds(file.stamp),
-                role,
+                role: told.role,
                 contributors: Vec::new(),
                 tags: vec![Tag::Unimported { beside: beside.map(|row| row.place.as_str().to_owned()) }],
             };
@@ -615,7 +644,7 @@ impl App {
             let at = entries.iter().position(|above| above.path == beside).map_or(entries.len(), |at| at + 1);
             entries.insert(at, entry);
         }
-        Ok(Listing { space: told, path: place.as_str().to_owned(), entries })
+        Ok(entries)
     }
 
     /// The row of the file at `place` in a folder.

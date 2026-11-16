@@ -73,6 +73,7 @@ async fn a_symlink_leads_nowhere() {
     symlink("../../outside/Private", home.join("Relative")).unwrap();
 
     assert_eq!(names(&ben.get::<Listing>(&paths::entries("home", "")).await.unwrap().entries), ["Seed"]);
+    assert_eq!(names(&ben.get::<Listing>(&paths::everything("home")).await.unwrap().entries), ["Seed"]);
     for folder in ["Out", "Out/Private", "Relative"] {
         let listing = ben.get::<Listing>(&paths::entries("home", folder)).await;
         assert!(listing.is_err(), "{folder} lists what is outside the space");
@@ -104,4 +105,34 @@ async fn a_name_that_is_no_folders_name_gets_no_space() {
 
 fn names_of(spaces: &[Space]) -> Vec<&str> {
     spaces.iter().map(|space| space.name.as_str()).collect()
+}
+
+#[tokio::test]
+async fn a_space_is_listed_whole_for_whoever_reaches_it() {
+    let server = Server::new("whole");
+    let ben = server.person("ben", &[]);
+    for (parent, name) in [("", "House"), ("House", "Roof"), ("", "Empty")] {
+        let folder = NewFolder { parent: parent.into(), name: name.into() };
+        ben.post::<Entry>(&paths::folders("home"), &folder).await.unwrap();
+    }
+    for (folder, name) in [("", "Seed"), ("House", "Garden"), ("House/Roof", "Quote")] {
+        ben.start("home", folder, name).await;
+    }
+
+    // Every folder and document, each where it is, and each document as its own folder lists it.
+    let whole = ben.get::<Listing>(&paths::everything("home")).await.unwrap().entries;
+    let mut paths_of: Vec<&str> = whole.iter().map(|entry| entry.path.as_str()).collect();
+    paths_of.sort();
+    assert_eq!(paths_of, ["Empty", "House", "House/Garden.let", "House/Roof", "House/Roof/Quote.let", "Seed.let"]);
+    let roof = ben.get::<Listing>(&paths::entries("home", "House/Roof")).await.unwrap().entries;
+    assert!(whole.contains(&roof[0]), "{:?}", roof[0]);
+    // A plain listing is the folder alone, as before.
+    assert_eq!(
+        names(&ben.get::<Listing>(&paths::entries("home", "")).await.unwrap().entries),
+        ["Empty", "House", "Seed"]
+    );
+
+    let mallory = server.person("mallory", &[]);
+    let theirs = mallory.get::<Listing>(&paths::everything("home")).await.unwrap().entries;
+    assert_eq!(names(&theirs), [] as [&str; 0], "another person's own space holds none of it");
 }

@@ -3093,6 +3093,9 @@ impl App {
                 letters_ui::Place::Folder { space, path } => {
                     session.entries(space, path).map(|listing| (Vec::new(), listing.entries))
                 }
+                letters_ui::Place::Whole { space } => {
+                    session.everything(space).map(|listing| (Vec::new(), listing.entries))
+                }
                 letters_ui::Place::Shared => session.shared().map(|entries| (Vec::new(), entries)),
                 letters_ui::Place::Recent => session.recent().map(|entries| (Vec::new(), entries)),
             };
