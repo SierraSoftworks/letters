@@ -158,6 +158,11 @@ pub enum Event {
     SignedIn(WindowId, Arc<AtomicBool>, Result<Arc<Session>, Option<String>>),
     /// A server said what a place of it holds, for a window's Open card, or why it could not be read.
     Browsed(WindowId, Result<Box<Browsed>, String>),
+    /// The server at this address said what is in its trash, for a window's Open card, or why not.
+    Trash(WindowId, String, Result<Vec<letters_api::Trashed>, String>),
+    /// A file a window was to hand to a server for a document was not brought in, and why, in a sentence
+    /// for the person.
+    Unbrought(WindowId, String),
     /// The socket of this number, to the server of a window's document, has something to say.
     Heard(WindowId, Said),
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
@@ -2632,7 +2637,13 @@ impl App {
                     }
                 }
                 Request::SignOut { server } => self.sign_out(&server, now),
-                Request::Browse { server, place } => self.browse(id, server, place, now),
+                Request::Browse { server, place } => self.browse(id, server, place, None, now),
+                Request::MergeConflictsOf { server, id: document, place } => {
+                    self.browse(id, server, place, Some(document), now);
+                }
+                Request::BrowseTrash { server } => self.browse_trash(id, server, None, now),
+                Request::PutBack { server, space, file } => self.browse_trash(id, server, Some((space, file)), now),
+                Request::ImportAt { server, space, path } => self.import_at(id, &server, space, path),
                 Request::OpenFrom { server, id: document } => self.reach(Some(id), &server, document),
                 Request::NewAt { server, space, path } => self.start_at(id, &server, space, path),
                 // A request this shell does not know yet.
@@ -2958,8 +2969,9 @@ impl App {
     }
 
     /// Asks the server at `server` what a place of it holds, for a window's Open card, on another thread.
-    /// The answer arrives as an event.
-    fn browse(&mut self, id: WindowId, server: String, place: letters_ui::Place, now: Instant) {
+    /// The answer arrives as an event. With `merge`, the conflict copies of the document of that id are
+    /// merged into it first, and the place is listed without them.
+    fn browse(&mut self, id: WindowId, server: String, place: letters_ui::Place, merge: Option<String>, now: Instant) {
         let Some(session) = self.sessions.get(&server).filter(|session| !session.ended()).cloned() else {
             // The card lists a server nobody is signed in to any more: it goes with the server's row.
             self.browsed(id, Err("Sign in to this server again to see its documents.".to_owned()), now);
@@ -2967,6 +2979,10 @@ impl App {
         };
         let proxy = self.proxy.clone();
         thread::spawn(move || {
+            if let Some(Err(refused)) = merge.map(|document| session.merge_conflicts(&document)) {
+                let refused = Err(connected::sentence(&refused));
+                return drop(proxy.send_event(Event::Browsed(id, refused)));
+            }
             let held = match &place {
                 letters_ui::Place::Spaces => session.spaces().map(|spaces| (spaces, Vec::new())),
                 letters_ui::Place::Folder { space, path } => {
@@ -2979,6 +2995,56 @@ impl App {
                 .map(|(spaces, entries)| Box::new(Browsed { server, place, spaces, entries }))
                 .map_err(|refused| connected::sentence(&refused));
             let _ = proxy.send_event(Event::Browsed(id, browsed));
+        });
+    }
+
+    /// Asks the server at `server` what is in its trash, for a window's Open card, on another thread.
+    /// The answer arrives as an event. With `back`, what a space's trash holds under that name is put
+    /// back first.
+    fn browse_trash(&mut self, id: WindowId, server: String, back: Option<(String, String)>, now: Instant) {
+        let Some(session) = self.sessions.get(&server).filter(|session| !session.ended()).cloned() else {
+            self.browsed(id, Err("Sign in to this server again to see its documents.".to_owned()), now);
+            return self.tell_servers(now);
+        };
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let put = back.map_or(Ok(()), |(space, file)| session.put_back(&space, &file).map(drop));
+            let thrown = put.and_then(|()| session.trash()).map_err(|refused| connected::sentence(&refused));
+            let _ = proxy.send_event(Event::Trash(id, server, thrown));
+        });
+    }
+
+    /// Has the person choose a Markdown or Word file, hands it to the server at `server` to make a
+    /// document of in `folder` of a space, and brings that document here, off this thread once the file
+    /// is chosen. It opens as a document of the server does: see [`Self::reached`].
+    fn import_at(&mut self, id: WindowId, server: &str, space: String, folder: String) {
+        let Some(window) = self.windows.get(&id) else { return };
+        let dialog = FileDialog::new().add_filter("Markdown and Word", &import::ENDINGS);
+        let chosen = dialog.set_directory(self.library.default_folder()).set_parent(&*window.window).pick_file();
+        let Some(path) = chosen else { return };
+        let Some(session) = self.sessions.get(server).filter(|session| !session.ended()).cloned() else {
+            let nobody = Err(Some("Nobody is signed in to that server any more.".to_owned()));
+            return drop(self.proxy.send_event(Event::Reached(Some(id), nobody)));
+        };
+        let (proxy, home) = (self.proxy.clone(), self.home.clone());
+        thread::spawn(move || {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let unbrought = |why: String| drop(proxy.send_event(Event::Unbrought(id, why)));
+            let file = match fs::read(&path) {
+                Ok(file) => file,
+                Err(error) => return unbrought(format!("{name} could not be brought in{}.", files::unread(&error))),
+            };
+            let entry = match session.import(&space, &folder, &name, &file) {
+                Ok(entry) => entry,
+                Err(refused) => {
+                    return unbrought(format!("{name} could not be brought in.\n\n{}", connected::sentence(&refused)));
+                }
+            };
+            let document = entry.id.ok_or("The server did not say which document it made.".to_owned());
+            let reached = document
+                .and_then(|document| connected::reach(&session, &document, &home).map_err(|error| error.to_string()));
+            let entered = reached.map(|reached| Box::new((session, reached))).map_err(Some);
+            let _ = proxy.send_event(Event::Reached(Some(id), entered));
         });
     }
 
@@ -4011,6 +4077,25 @@ impl ApplicationHandler<Event> for App {
                 }
                 // The card asks for the next place once it has the spaces.
                 self.serve(event_loop, id, now);
+            }
+            Event::Trash(id, server, thrown) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    match thrown {
+                        Ok(thrown) => window.view.set_trash(&server, thrown),
+                        Err(why) => window.view.refuse_browse(&why),
+                    }
+                    window.access_stale = true;
+                    window.sync(now);
+                }
+                if self.sessions.values().any(|session| session.ended()) {
+                    self.sessions.retain(|_, session| !session.ended());
+                    self.tell_servers(now);
+                }
+            }
+            Event::Unbrought(id, why) => {
+                if let Some(window) = self.windows.get(&id) {
+                    window.alert(&why);
+                }
             }
             Event::Heard(id, said) => {
                 if let Some(window) = self.windows.get_mut(&id) {

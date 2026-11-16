@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use letters_api::{
     Access, Code, CreatedLink, Entry, Grant, Limits, Listing, Move, NewDocument, NewFolder, NewLink, Opened, Person,
-    Rename, Shares, Space, Token, paths,
+    Rename, Shares, Space, Token, Trashed, paths,
 };
 
 use crate::keychain::{Keychain, Unkept};
@@ -211,6 +211,33 @@ impl Session {
     pub fn new_folder(&self, space: &str, parent: &str, name: &str) -> Result<Entry, Refused> {
         let new = NewFolder { parent: parent.to_owned(), name: name.to_owned() };
         self.ask(|server, token| server.post(token, &paths::folders(space), &new))
+    }
+
+    /// Makes a document of a Markdown or Word file in `folder` of a space. `name` is the file's own, which
+    /// names the document without its ending. A file that is neither is refused as [`Code::Invalid`].
+    pub fn import(&self, space: &str, folder: &str, name: &str, file: &[u8]) -> Result<Entry, Refused> {
+        self.ask(|server, token| server.hand(token, &paths::import(space, folder, name), file))
+    }
+
+    /// Merges into a document every conflict copy a sync tool left beside it on the server, and gives
+    /// the names of the copies it took. The server reads the copies before it holds the document, which
+    /// may be moved meanwhile: it then answers [`Code::Stale`], and is asked once more.
+    pub fn merge_conflicts(&self, id: &str) -> Result<Vec<String>, Refused> {
+        let merge = || self.ask(|server, token| server.done(token, &paths::merge_conflicts(id)));
+        match merge() {
+            Err(refused) if refused.code() == Some(Code::Stale) => merge(),
+            merged => merged,
+        }
+    }
+
+    /// What is in the trash of every space the person reaches, the last thrown away first.
+    pub fn trash(&self) -> Result<Vec<Trashed>, Refused> {
+        self.ask(|server, token| server.get(token, paths::TRASH))
+    }
+
+    /// Takes what a [`Trashed`] names by its `file` out of the trash of `space`, back to where it was.
+    pub fn put_back(&self, space: &str, file: &str) -> Result<Entry, Refused> {
+        self.ask(|server, token| server.done(token, &paths::put_back(space, file)))
     }
 
     /// Who a document is shared with, besides those its space lets in.

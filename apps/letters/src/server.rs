@@ -160,6 +160,19 @@ impl Client {
         self.call(Verb::Post, path, Some(token), None, LIMIT, ANSWER).map(drop)
     }
 
+    /// Asks for something to be done that needs no more said than its `path`, and gives what the server
+    /// answers of it, as putting a document back gives where it now is.
+    pub fn done<T: DeserializeOwned>(&self, token: &str, path: &str) -> Result<T, Refused> {
+        read(&self.call(Verb::Post, path, Some(token), None, LIMIT, ANSWER)?)
+    }
+
+    /// Hands the server a file as it is, to make something of, and gives what it made: a Markdown or Word
+    /// file becomes a document.
+    pub fn hand<T: DeserializeOwned>(&self, token: &str, path: &str, file: &[u8]) -> Result<T, Refused> {
+        let body = Some(("application/octet-stream", file));
+        read(&self.call(Verb::Post, path, Some(token), body, CARRYING, ANSWER)?)
+    }
+
     /// Takes away what the server has at `path`, as revoking a link does.
     pub fn delete(&self, token: &str, path: &str) -> Result<(), Refused> {
         self.call(Verb::Delete, path, Some(token), None, LIMIT, ANSWER).map(drop)

@@ -19,8 +19,8 @@ use letters::servers;
 use letters::session::Session;
 use letters::signin::{SignIn, Unsigned};
 use letters_api::{
-    Access, Action, Allows, Code, CreatedLink, Exchange, Grant, Grantee, Link, NewLink, Opened, Person, Renewal, Role,
-    Shares, Space, SpaceKind, Token, Trust, Who, paths,
+    Access, Action, Allows, Code, CreatedLink, Entry, EntryKind, Exchange, Grant, Grantee, Link, NewLink, Opened,
+    Person, Renewal, Role, Shares, Space, SpaceKind, Token, Trashed, Trust, Who, paths,
 };
 use letters_format::{OPLOG, Package};
 use letters_model::{Block, BlockKind, Document, Model, ReplicaId};
@@ -122,6 +122,40 @@ fn opened() -> Opened {
     }
 }
 
+/// A document of the person's space, as a folder lists it.
+fn entry(name: &str, folder: &str, id: &str) -> Entry {
+    Entry {
+        kind: EntryKind::Document,
+        name: name.into(),
+        space: Some("ada".into()),
+        path: [folder, &format!("{name}.let")]
+            .iter()
+            .filter(|part| !part.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("/"),
+        id: Some(id.into()),
+        created: None,
+        modified: 1,
+        role: Role::Owner,
+        contributors: Vec::new(),
+        tags: Vec::new(),
+    }
+}
+
+/// A document of the folder House that was thrown away, as the trash lists it.
+fn thrown(name: &str, file: &str) -> Trashed {
+    Trashed {
+        kind: EntryKind::Document,
+        name: name.into(),
+        space: "ada".into(),
+        folder: "House".into(),
+        file: file.into(),
+        thrown: 2,
+        role: Role::Owner,
+    }
+}
+
 /// What the Letters server of these tests knows.
 #[derive(Default)]
 struct Letters {
@@ -140,6 +174,8 @@ struct Letters {
     shares: Shares,
     /// How many more times the document is found moved while a file handed over for it was read.
     moved: u32,
+    /// What was thrown away, the last first.
+    trash: Vec<Trashed>,
 }
 
 impl Letters {
@@ -188,6 +224,29 @@ impl Letters {
                 said(Code::Stale, "That document was moved just now.")
             }
             "PUT /api/v1/documents/d1/file" => Answer("204 No Content", "", Vec::new()),
+            "POST /api/v1/documents/d1/merge-conflicts" if self.moved > 0 => {
+                self.moved -= 1;
+                said(Code::Stale, "That document was moved just now.")
+            }
+            "POST /api/v1/documents/d1/merge-conflicts" => json(&["Roof repairs (conflicted copy).let"]),
+            "GET /api/v1/trash" => json(&self.trash),
+            line if line.starts_with("POST /api/v1/spaces/ada/trash/put-back?file=") => {
+                let file = &line["POST /api/v1/spaces/ada/trash/put-back?file=".len()..];
+                match self.trash.iter().position(|thrown| paths::segment(&thrown.file) == file) {
+                    Some(at) => {
+                        let back = self.trash.remove(at);
+                        json(&entry(&back.name, &back.folder, "d2"))
+                    }
+                    None => said(Code::Invalid, "That is not in the trash."),
+                }
+            }
+            // A file is told by what it holds, and these tests hand over Markdown only.
+            "POST /api/v1/spaces/ada/import?path=House&name=Rates.md" if std::str::from_utf8(&asked.body).is_ok() => {
+                json(&entry("Rates", "House", "d3"))
+            }
+            line if line.starts_with("POST /api/v1/spaces/ada/import?") => {
+                said(Code::Invalid, "That is neither Markdown nor a Word document.")
+            }
             "PUT /api/v1/documents/d1/assets/sky.png" => Answer("204 No Content", "", Vec::new()),
             // A picture is asked for by the hash of its bytes, and one name gets another's bytes.
             line if line.strip_prefix("GET /api/v1/documents/d1/assets/").is_some_and(|name| name == held()) => {
@@ -283,6 +342,12 @@ impl Server {
     /// A session that begins with the first token, which has run out.
     fn session(&self) -> Session {
         Session::begin(self.client(), Some(*KEYCHAIN), token(0))
+    }
+
+    /// The last request whose line holds `part`, whole. It stays for [`Self::asked`].
+    fn heard(&self, part: &str) -> Asked {
+        let asked = self.asked.lock().unwrap();
+        asked.iter().rev().find(|asked| asked.line.contains(part)).cloned().expect("it was asked")
     }
 
     /// What was asked since the last look, as each request's line and the token it showed.
@@ -807,6 +872,61 @@ fn a_file_for_a_document_that_moved_meanwhile_is_handed_over_once_more() {
     assert_eq!(told(refused), [Told::Unsent("That document was moved just now.".into())]);
     let large = Refused::Said(letters_api::Error::new(Code::TooLarge, "That is too large."));
     assert_eq!(told(large), [Told::Refused(Refusal::TooLarge)]);
+}
+
+#[test]
+fn the_conflict_copies_of_a_document_that_moved_meanwhile_are_merged_at_the_second_asking() {
+    let server = Server::start();
+    let session = server.session();
+    let moved = |times: u32| {
+        server.letters.lock().unwrap().moved = times;
+        let merged = session.merge_conflicts("d1");
+        let asks = server.asked().iter().filter(|(line, _)| line.ends_with("/d1/merge-conflicts")).count();
+        (merged, asks)
+    };
+
+    let took = Ok(vec!["Roof repairs (conflicted copy).let".to_owned()]);
+    assert_eq!(moved(0), (took.clone(), 1), "the server names the copies it took");
+    assert_eq!(moved(1), (took, 2));
+    let (refused, asks) = moved(2);
+    assert_eq!(asks, 2, "and no more often than that");
+    let refused = refused.expect_err("the server refused twice");
+    assert_eq!(connected::sentence(&refused), "That document was moved just now.");
+}
+
+#[test]
+fn what_was_thrown_away_is_listed_and_put_back_by_its_name_in_the_trash() {
+    let server = Server::start();
+    let session = server.session();
+    assert_eq!(session.trash(), Ok(Vec::new()));
+
+    let trash = vec![thrown("Rates", "Rates 2.let"), thrown("Rates", "Rates.let")];
+    server.letters.lock().unwrap().trash = trash.clone();
+    assert_eq!(session.trash(), Ok(trash.clone()), "the last thrown away first, as the server has them");
+
+    let back = session.put_back("ada", "Rates 2.let").expect("an owner may put it back");
+    assert_eq!((back.name.as_str(), back.path.as_str()), ("Rates", "House/Rates.let"));
+    assert_eq!(session.trash(), Ok(trash[1..].to_vec()), "and the trash no longer lists it");
+
+    // What is no longer there is refused in the server's own sentence, which the card shows.
+    let gone = session.put_back("ada", "Rates 2.let").expect_err("it was put back already");
+    assert_eq!(connected::sentence(&gone), "That is not in the trash.");
+}
+
+#[test]
+fn a_file_is_handed_to_the_server_whole_and_becomes_a_document_there() {
+    let server = Server::start();
+    let session = server.session();
+    let markdown = "# Rates\n\nRates change in January.\n";
+
+    let made = session.import("ada", "House", "Rates.md", markdown.as_bytes()).expect("Markdown is taken");
+    assert_eq!((made.name.as_str(), made.id.as_deref()), ("Rates", Some("d3")), "its id opens it as any other");
+    let heard = server.heard("/import?");
+    assert_eq!(heard.body, markdown.as_bytes(), "the server tells what the file is from what it holds");
+
+    let refused = session.import("ada", "House", "Rates.md", &[0xff, 0xfe]).expect_err("neither of the two");
+    assert_eq!(refused.code(), Some(Code::Invalid));
+    assert_eq!(connected::sentence(&refused), "That is neither Markdown nor a Word document.");
 }
 
 #[test]
