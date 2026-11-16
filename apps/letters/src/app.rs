@@ -2720,7 +2720,8 @@ impl App {
                 Request::PutBack { server, space, file } => self.browse_trash(id, server, Some((space, file)), now),
                 Request::ImportAt { server, space, path } => self.import_at(event_loop, id, server, space, path),
                 Request::OpenFrom { server, id: document } => self.reach(Some(id), &server, document),
-                Request::NewAt { server, space, path } => self.start_at(id, &server, space, path),
+                Request::NewAt { server, space, path } => self.start_at(id, &server, space, path, false),
+                Request::ImportFile { server, space, path } => self.start_at(id, &server, space, path, true),
                 // A request this shell does not know yet.
                 _ => {}
             }
@@ -3121,16 +3122,22 @@ impl App {
         }
     }
 
-    /// Starts a document in `folder` of a space of the server at `server` and brings it here, on another
-    /// thread, for the window that asked. It opens as a document of the server does: see [`Self::reached`].
-    fn start_at(&mut self, id: WindowId, server: &str, space: String, folder: String) {
+    /// Starts a document in the folder `at` of a space of the server at `server` and brings it here, on
+    /// another thread, for the window that asked. It opens as a document of the server does: see
+    /// [`Self::reached`]. With `import`, `at` is a Markdown or Word file the space keeps, and the document
+    /// is made of it, beside it.
+    fn start_at(&mut self, id: WindowId, server: &str, space: String, at: String, import: bool) {
         let Some(session) = self.sessions.get(server).filter(|session| !session.ended()).cloned() else {
             let nobody = Err(Some("Nobody is signed in to that server any more.".to_owned()));
             return drop(self.proxy.send_event(Event::Reached(Some(id), nobody)));
         };
         let (proxy, home) = (self.proxy.clone(), self.home.clone());
         thread::spawn(move || {
-            let started = session.new_document(&space, &folder, None).map_err(|refused| connected::sentence(&refused));
+            let started = match import {
+                true => session.import_file(&space, &at),
+                false => session.new_document(&space, &at, None),
+            };
+            let started = started.map_err(|refused| connected::sentence(&refused));
             let reached = started.and_then(|entry| {
                 let document = entry.id.ok_or("The server did not say which document it started.")?;
                 connected::reach(&session, &document, &home).map_err(|error| error.to_string())
