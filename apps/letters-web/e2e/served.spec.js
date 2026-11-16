@@ -373,6 +373,19 @@ test("a host the person always loads pictures from is kept by their account, unt
   expect(theirs).toEqual([]);
 });
 
+test("a source typed in the settings brings in the pictures on the page that are under it", async ({ page }) => {
+  const answer = fetches({ fetch: (_, asked) => asked && picture(INK).bytes });
+  const theirs = account();
+  const asked = await serve(page, opened(), (method, path, body) => theirs(method, path) ?? answer(method, path, body), linked);
+  await page.keyboard.press("ControlOrMeta+,");
+  await click(page, "Trust a source", "textbox");
+  await page.keyboard.type("pictures.example");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => told(asked).filter((line) => line.startsWith("POST /fetch/picture"))).toEqual([asking(false), asking(true)]);
+  await page.keyboard.press("Escape");
+  await expect.poll(() => inked(page)).toBeGreaterThan(1000);
+});
+
 const typed = [
   { name: "is trusted as the account writes it", refusal: undefined, listed: 1 },
   { name: "that is none is refused in the server's words", refusal: { status: 400, body: { code: "invalid", message: "That is not a source of pictures." } }, listed: 0 },
