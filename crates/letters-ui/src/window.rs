@@ -50,6 +50,7 @@ use crate::maths::{self, Maths, Sheet, SheetLines, Source};
 use crate::merging::{Confirmed, MergeAsk, MergeFile, Merges, Merging};
 use crate::motion::{self, FRAME_MS};
 use crate::notes::{self, Margin, Noting};
+use crate::notices::{self, Notice, Noticing};
 use crate::opening::{self, Landing, Location, Recent, Request};
 use crate::paint::scrollbar;
 use crate::peek::{self, Peek, Peeks};
@@ -268,6 +269,8 @@ pub enum Message {
     Import(Import),
     /// What is done about the toast that counts the notes of an import.
     Imported(Imported),
+    /// What is done about a notice the shell had the window say.
+    Notice(Noticing),
     /// What is done on the card that saves a copy of the document, or writes it in another format.
     Copy(Copying),
     /// What the Styles panel asks for: the person's default, page setup and stylesheets.
@@ -567,6 +570,18 @@ impl Ui<EditorApp> {
     /// and leads to the first, for a few seconds.
     pub fn say_imported(&mut self) {
         self.app_mut().imported = Some(None);
+    }
+
+    /// Says something that happened once, over the foot of the page: a sentence with one button, as the
+    /// import's toast lies there. It stays until the person presses the button, which asks
+    /// [`Request::NoticePressed`] with the notice's key, or puts it away. Of several, the first said shows
+    /// first, and one said again by its key takes the place of the one before.
+    pub fn notify(&mut self, notice: Notice) {
+        let notices = &mut self.app_mut().notices;
+        match notices.iter_mut().find(|known| known.key == notice.key) {
+            Some(known) => *known = notice,
+            None => notices.push(notice),
+        }
     }
 
     /// Has the bar say for a few seconds which folder the document was written to, after its first write.
@@ -1306,6 +1321,8 @@ pub struct EditorApp {
     /// Whether the toast about an import that was just done shows, and since when, once a frame has shown
     /// it.
     imported: Option<Option<u64>>,
+    /// What the shell had the window say, and the person has not answered yet: the first of them shows.
+    notices: Vec<Notice>,
     requests: Vec<Request>,
     /// The pictures the shell has handed over, by asset name.
     images: Images,
@@ -1450,6 +1467,7 @@ impl EditorApp {
             usage_notice: false,
             importing: None,
             imported: None,
+            notices: Vec::new(),
             requests: Vec::new(),
             images: Images::default(),
             wanted: HashSet::new(),
@@ -5661,6 +5679,12 @@ impl EditorApp {
                     self.does(Message::Note(Noting::Open(first)), platform);
                 }
             }
+            Message::Notice(asked) => {
+                // Either way it has been answered, and the next one shows.
+                let notice = (!self.notices.is_empty()).then(|| self.notices.remove(0));
+                let pressed = notice.filter(|_| asked == Noticing::Press);
+                self.requests.extend(pressed.map(|notice| Request::NoticePressed(notice.key)));
+            }
             Message::Copy(_) if !self.allows.download => {}
             Message::Copy(message) => self.copy(message),
             Message::Styles(message) => self.styling(message, platform),
@@ -5850,11 +5874,15 @@ impl App for EditorApp {
             let end = room.width - if chapters.is_some() { chapters_width() } else { 0.0 };
             self.find.view(self.find.current(self.editor.selection()), bar, end, room.width)
         });
-        // The toast about an import lies over the foot of the page, and is the first stop after it.
+        // What the shell had the window say lies over the foot of the page, and is the first stop after it.
+        let told = self.notices.first().filter(|_| !away && !self.carded());
+        let told = told.map(|notice| notices::toast(notice, room));
+        // So does the toast about an import, once nothing else waits to be said.
         let toast = self.imported.filter(|_| !away && !self.carded()).map(|_| {
             let keys = commands::shortcut(&Act::Note { back: false }, self.editor.keymap(), self.mac);
             importing::toast(self.margin.imports().0, keys.as_deref(), room)
         });
+        let toast = told.or(toast);
         // So does the toast about what others wrote since the last visit, for one who can look it up.
         let news = self.seen.as_ref().filter(|_| self.rewinds() && !away && !self.carded());
         let toast = toast.or_else(|| news.and_then(|seen| seen.toast(room)));

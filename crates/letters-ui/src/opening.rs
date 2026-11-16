@@ -282,6 +282,9 @@ pub enum Request {
         space: String,
         path: String,
     },
+    /// Do what the button of a notice is for: the one handed to `Window::notify` with this
+    /// [`Notice::key`](crate::Notice::key). The notice has gone by then.
+    NoticePressed(String),
     /// Say what is in the trash of the server at this address with `Window::set_trash`, or why it could not
     /// be read with `Window::refuse_browse`. The card that opens a server's documents asks it.
     BrowseTrash {

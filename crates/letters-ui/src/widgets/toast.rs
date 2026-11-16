@@ -20,12 +20,20 @@ pub struct Toast<M> {
     icon: Icon,
     action: Option<Element<M>>,
     on_dismiss: Option<M>,
+    wraps: bool,
 }
 
 impl<M> Toast<M> {
     /// A toast that says `message`, in a few words: it keeps to one line.
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), icon: icon::INFO, action: None, on_dismiss: None }
+        Self { message: message.into(), icon: icon::INFO, action: None, on_dismiss: None, wraps: false }
+    }
+
+    /// For a message that is a sentence: it runs over as many lines as it needs, and what can be done about
+    /// it stands under it.
+    pub fn wraps(mut self) -> Self {
+        self.wraps = true;
+        self
     }
 
     pub fn icon(mut self, icon: Icon) -> Self {
@@ -51,14 +59,33 @@ impl<M: Clone + 'static> Toast<M> {
     /// The toast at the bottom end of a room of this size, as an overlay: it goes among the children of
     /// what fills the room, after whatever it lies over.
     pub fn over(self, room: Size) -> Element<M> {
-        let said = Element::text(self.message.clone(), TextStyle::control().size(tokens::TEXT_MD));
+        let style = TextStyle::control().size(tokens::TEXT_MD);
         // What can be done stands a little apart from what is said.
         let apart = Edges { right: if self.action.is_some() { tokens::SPACE_SM } else { 0.0 }, ..Edges::ZERO };
-        let said = Element::row().padding(apart).shrink().child(said.shrink());
+        let (mark, said, action) = match self.wraps {
+            false => {
+                let said = Element::text(self.message.clone(), style).shrink();
+                (Element::icon(self.icon, ICON), Element::row().padding(apart).shrink().child(said), self.action)
+            }
+            true => {
+                // The first line stands level with the button that puts the toast away.
+                let level = |tall: f32| Edges::top(((tokens::CONTROL_HEIGHT_SM - tall) / 2.0).max(0.0));
+                let said = Element::paragraph(self.message.clone(), style).grow(1.0).shrink();
+                let under = self.action.map(|action| Element::row().child(action));
+                let said = Element::column()
+                    .grow(1.0)
+                    .shrink()
+                    .gap(tokens::SPACE_SM)
+                    .padding(level((style.size * style.leading).round()))
+                    .child(said)
+                    .children(under);
+                (Element::row().padding(level(ICON)).child(Element::icon(self.icon, ICON)), said, None)
+            }
+        };
         let padding =
             Edges { top: tokens::SPACE_SM, right: tokens::SPACE_SM, bottom: tokens::SPACE_SM, left: tokens::SPACE_MD };
         let mut toast = Element::row()
-            .align(Align::Center)
+            .align(if self.wraps { Align::Start } else { Align::Center })
             .gap(tokens::SPACE_SM)
             .max_width(WIDTH)
             .padding(padding)
@@ -69,9 +96,9 @@ impl<M: Clone + 'static> Toast<M> {
             .shadow(tokens::SHADOW_OVERLAY)
             .role(Role::Status)
             .label(self.message)
-            .child(Element::icon(self.icon, ICON).fg(tokens::FG_MUTED))
+            .child(mark.fg(tokens::FG_MUTED))
             .child(said)
-            .children(self.action);
+            .children(action);
         if let Some(message) = self.on_dismiss {
             toast = toast.child(Button::icon_only(icon::X, "Dismiss").subtle().small().on_press(message));
         }
