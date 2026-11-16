@@ -787,7 +787,7 @@ fn the_places_are_one_stop_of_the_tab_key_at_the_place_that_is_looked_at() {
     }
     assert_eq!(at(&mut window), "Sam Okafor");
     window.key("Shift+Tab");
-    assert_eq!(at(&mut window), "This device", "the places cost one press to pass");
+    assert_eq!(at(&mut window), "Search", "the places cost one press to pass");
     window.key("Tab").key("Up").key("Enter");
     assert_eq!(window.ui().take_requests(), [browse(HOME, within("family", ""))]);
 
@@ -1138,4 +1138,135 @@ fn the_landing_card_makes_way_for_the_servers_documents() {
     window.key("Escape").assert_closed(Role::Dialog, "Open");
     assert!(window.ui().landing());
     assert!(has(&mut window, Role::Button, "New document"));
+}
+
+/// Everything the person's own space holds, in whatever folder, as a server lists a space whole.
+fn whole() -> Vec<Entry> {
+    let by = |path: &str, id: &str, people: &[&str]| Entry {
+        contributors: people.iter().map(|&name| name.to_owned()).collect(),
+        ..document("sam", path, id, DAY)
+    };
+    let mut held = own();
+    held.extend([
+        folder("sam", "House/Roof"),
+        by("House/Roof/Roof quote.let", "d3", &["Alice Moreau"]),
+        by("House/Garden notes.let", "d4", &["Sam Okafor"]),
+        by("Letters sent/Roofer.let", "d5", &["Sam Okafor", "Alice Moreau"]),
+    ]);
+    held
+}
+
+fn everything(space: &str) -> Place {
+    Place::Whole { space: space.into() }
+}
+
+/// Types into the card's field, and answers the space whole if it was asked for.
+fn search(window: &mut Harness, typed: &str) {
+    window.click(Role::TextInput, "Search").key("Mod+A").type_text(typed);
+    if window.ui().take_requests().contains(&browse(HOME, everything("sam"))) {
+        window.ui().set_listing(listing(HOME, everything("sam"), whole()));
+    }
+}
+
+#[test]
+fn a_search_finds_documents_in_every_folder_of_the_space() {
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, own());
+
+    // The space is asked for whole once, when the search starts, and the wait is said.
+    window.click(Role::TextInput, "Search").type_text("r");
+    assert_eq!(window.ui().take_requests(), [browse(HOME, everything("sam"))]);
+    assert!(has(&mut window, Role::Status, ASKING), "the wait is said");
+    window.type_text("f");
+    assert_eq!(window.ui().take_requests(), [], "it is not asked for again");
+    window.ui().set_listing(listing(HOME, everything("sam"), whole()));
+
+    // Each: what is typed, and what is found. The first is the best, where the cases say which that is.
+    let cases: [(&str, &[&str]); 6] = [
+        ("roof quote", &["Roof quote"]),
+        ("hrq", &["Roof quote"]),
+        ("garden", &["Garden notes"]),
+        ("roof author:sam", &["Roofer"]),
+        ("is:folder roof", &["Roof"]),
+        ("author:alice", &["Roof quote", "Roofer"]),
+    ];
+    for (typed, wanted) in cases {
+        search(&mut window, typed);
+        let mut found = listed(&mut window, "Documents").0;
+        found.sort();
+        assert_eq!(found, wanted, "{typed:?}");
+    }
+    search(&mut window, "roof");
+    let found = listed(&mut window, "Documents").0;
+    let at = |name: &str| found.iter().position(|found| found == name);
+    assert!(at("Roofer").is_some() && at("Roof").is_some(), "{found:?}");
+    assert!(at("Roof plan") < at("Roof quote"), "of two that stand as well, the nearer is first: {found:?}");
+    // What is found says where it is.
+    let about = window.find(Role::ListBoxOption, "Roof quote").and_then(|found| found.description).unwrap_or_default();
+    assert!(about.contains("In House / Roof"), "{about}");
+
+    search(&mut window, "zebra");
+    assert!(window.find(Role::ListBox, "Documents").is_none(), "nothing is listed");
+    let said = window.controls().into_iter().any(|found| found.role == Role::Status && found.name.contains("author:"));
+    assert!(said, "nothing found is said, with the filters there are");
+
+    // With the field empty again the folder is listed as it was.
+    window.click(Role::TextInput, "Search").key("Mod+A").key("Backspace");
+    assert_eq!(listed(&mut window, "Documents").0, ["House", "Letters sent", "Roof plan", "Tax 2026"]);
+}
+
+#[test]
+fn what_a_search_found_is_opened_or_gone_into() {
+    // Enter in the field takes the best.
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, own());
+    search(&mut window, "roof quote");
+    window.key("Enter");
+    assert_eq!(window.ui().take_requests(), [Request::OpenFrom { server: HOME.into(), id: "d3".into() }]);
+    window.assert_closed(Role::Dialog, "Open");
+
+    // A folder that is found is gone into, and the search ends there.
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, own());
+    search(&mut window, "is:folder roof");
+    window.click(Role::ListBoxOption, "Roof");
+    assert_eq!(window.ui().take_requests(), [browse(HOME, within("sam", "House/Roof"))]);
+    window.ui().set_listing(listing(
+        HOME,
+        within("sam", "House/Roof"),
+        vec![document("sam", "House/Roof/Roof quote.let", "d3", 0)],
+    ));
+    assert_eq!(listed(&mut window, "Documents").0, ["Roof quote"]);
+    // The next search reads the space as it is then.
+    window.click(Role::TextInput, "Search").type_text("x");
+    assert_eq!(window.ui().take_requests(), [browse(HOME, everything("sam"))]);
+}
+
+#[test]
+fn a_search_of_what_is_shared_or_recent_asks_the_server_nothing() {
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, own());
+    window.click(Role::ListBoxOption, "Shared with me");
+    window.ui().take_requests();
+    let lent = |name: &str, id: &str| Entry { space: None, path: String::new(), ..document("", name, id, DAY) };
+    window.ui().set_listing(listing(HOME, Place::Shared, vec![lent("Street party", "s1"), lent("Roof fund", "s2")]));
+    window.click(Role::TextInput, "Search").type_text("rf");
+    assert_eq!(window.ui().take_requests(), []);
+    assert_eq!(listed(&mut window, "Documents").0, ["Roof fund"]);
+}
+
+#[test]
+fn a_space_that_cannot_be_searched_says_why_and_is_asked_again() {
+    let mut window = signed_in(&[HOME]);
+    open(&mut window, own());
+    window.click(Role::TextInput, "Search").type_text("r");
+    window.ui().take_requests();
+    window.ui().refuse_browse(REFUSAL);
+    assert!(has(&mut window, Role::Alert, REFUSAL));
+    window.type_text("o");
+    assert_eq!(window.ui().take_requests(), [browse(HOME, everything("sam"))]);
+    // An answer that comes after the search ended is let go.
+    window.key("Mod+A").key("Backspace");
+    window.ui().set_listing(listing(HOME, everything("sam"), whole()));
+    assert_eq!(listed(&mut window, "Documents").0, ["House", "Letters sent", "Roof plan", "Tax 2026"]);
 }

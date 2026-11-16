@@ -183,13 +183,22 @@ struct InFolder {
     path: String,
 }
 
+#[derive(Deserialize)]
+struct Listed {
+    #[serde(default)]
+    path: String,
+    /// Everything under the folder, in whatever folder of it.
+    #[serde(default)]
+    deep: bool,
+}
+
 async fn entries(
     State(app): State<Shared>,
     who: Signed,
     Path(space): Path<String>,
-    Query(at): Query<InFolder>,
+    Query(at): Query<Listed>,
 ) -> Answer<Json<Listing>> {
-    blocking(move || app.listing(&who, &space, &at.path).map(Json)).await
+    blocking(move || app.listing(&who, &space, &at.path, at.deep).map(Json)).await
 }
 
 async fn new_document(
@@ -561,11 +570,21 @@ impl App {
         Ok(Found { space: None, role, allows, until: Some(linked.ends), root, place })
     }
 
-    pub fn listing(&self, who: &Signed, space: &str, folder: &str) -> Answer<Listing> {
+    /// What the folder at `folder` of a space holds. A `deep` listing goes on with what each folder in it
+    /// holds, down to the last, for a shell to search the space in.
+    pub fn listing(&self, who: &Signed, space: &str, folder: &str, deep: bool) -> Answer<Listing> {
         let (space, role) = self.space(who, space)?;
         let (root, place) = (self.root(who, space)?, Place::parse(folder)?);
         let told = space.told(role);
-        let rows = self.library.list(&self.store, &root, &place)?;
+        let mut rows = self.library.list(&self.store, &root, &place)?;
+        let mut read = 0;
+        while deep && read < rows.len() {
+            let folders: Vec<Place> =
+                rows[read..].iter().filter(|row| row.listed.folder).map(|row| row.place.clone()).collect();
+            read = rows.len();
+            // A folder that cannot be read, or went away meanwhile, holds nothing to find.
+            rows.extend(folders.iter().filter_map(|at| self.library.list(&self.store, &root, at).ok()).flatten());
+        }
         let entries = rows.iter().map(|row| self.told(who, placed(&told, row), &root, row)).collect();
         Ok(Listing { space: told, path: place.as_str().to_owned(), entries })
     }

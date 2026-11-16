@@ -101,6 +101,13 @@ pub fn entries(space: &str, folder: &str) -> String {
     out
 }
 
+/// `GET`: a [`Listing`](crate::Listing) of everything in the space, in whatever folder of it: what the
+/// space itself holds first, then what its folders hold, and so on down. It is what a shell searches a
+/// space in, with a [`Query`](crate::Query).
+pub fn everything(space: &str) -> String {
+    format!("{SPACES}/{}/entries?deep=true", segment(space))
+}
+
 /// `POST` a [`NewDocument`](crate::NewDocument): its [`Entry`](crate::Entry).
 pub fn documents(space: &str) -> String {
     format!("{SPACES}/{}/documents", segment(space))

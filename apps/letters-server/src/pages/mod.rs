@@ -343,7 +343,7 @@ async fn folder(
     let shown = blocking({
         let (app, who) = (app.clone(), who.clone());
         move || {
-            let listing = app.listing(&who, &space, &path)?;
+            let listing = app.listing(&who, &space, &path, false)?;
             let now = app.now();
             let (edits, owns) = (listing.space.role.edits(), listing.space.role == Role::Owner);
             let about = |id: &String| listing.entries.iter().find(|entry| entry.id.as_ref() == Some(id)).cloned();

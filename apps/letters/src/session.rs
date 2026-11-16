@@ -136,6 +136,11 @@ impl Session {
         self.ask(|server, token| server.get(token, &paths::entries(space, folder)))
     }
 
+    /// Everything a space holds, in whatever folder of it.
+    pub fn everything(&self, space: &str) -> Result<Listing, Refused> {
+        self.ask(|server, token| server.get(token, &paths::everything(space)))
+    }
+
     /// The documents the person opened lately, newest first.
     pub fn recent(&self) -> Result<Vec<Entry>, Refused> {
         self.ask(|server, token| server.get(token, paths::RECENT))

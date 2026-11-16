@@ -7,7 +7,7 @@
 //! could not be read.
 
 use accesskit::Role;
-use letters_api::{Entry, EntryKind, Role as Grade, Space, SpaceKind, Tag, Trashed};
+use letters_api::{Entry, EntryKind, Query, Role as Grade, Space, SpaceKind, Tag, Trashed};
 
 use crate::color::fade;
 use crate::element::Element;
@@ -19,7 +19,7 @@ use crate::style::{Align, Dir, Edges, Justify, Look, Ring};
 use crate::text::TextStyle;
 use crate::threads::{FACE, face, lettered};
 use crate::tokens::{self, Color as Ink};
-use crate::widgets::{Button, Popover, Segmented, Side};
+use crate::widgets::{Button, Popover, Segmented, Side, TextField};
 use crate::window::Message;
 
 /// How wide the card is where the window has the room.
@@ -39,6 +39,8 @@ const DAY: f32 = 88.0;
 /// wider, for a button that says in words that it waits.
 const BACK: f32 = 104.0;
 const BACK_ROOMY: f32 = 120.0;
+/// How many of what a search found are listed: the best of them, which is where it is looked for.
+const FOUND: usize = 100;
 
 /// How much a card has room for, by how wide it is.
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
@@ -69,6 +71,9 @@ pub enum Place {
     /// A folder of a space, by the space's id and the folder's path in it as
     /// [`Entry::path`](letters_api::Entry::path) writes it. The space itself has an empty path.
     Folder { space: String, path: String },
+    /// Everything a space holds, in whatever folder of it, as `letters_api::paths::everything` lists it:
+    /// what the card searches a space in. It is asked for and never looked at as a place.
+    Whole { space: String },
     /// The documents others shared with the person.
     Shared,
     /// The documents the person had open lately.
@@ -108,6 +113,11 @@ pub enum Browsing {
     Merge(String),
     /// Make a document in the folder that is looked at out of a file of this device.
     Import,
+    /// Find what the field holds: in the whole space of the folder that is looked at, or among the
+    /// documents of another place.
+    Seek(String),
+    /// Enter in the field, which takes the best of what was found.
+    Take,
     /// Look at what was thrown away on the server.
     Trash,
     /// Put back what `file` names in the trash of this space.
@@ -139,6 +149,11 @@ pub(crate) struct Browser {
     /// The trash is looked at in place of `place`, and what is in it once the server has said.
     binned: bool,
     thrown: Option<Vec<Trashed>>,
+    /// What the field holds, to find documents by.
+    sought: String,
+    /// The space that is searched while a folder of it is looked at, and everything it holds once the
+    /// server has said. It is asked for when the search starts, and let go when it ends.
+    whole: Option<(String, Option<Vec<Entry>>)>,
     /// Why the last place could not be read, or what was asked of a row could not be done.
     notice: Option<String>,
     /// The rows whose answer is waited for, in the order they were asked: a document whose conflict copies
@@ -176,7 +191,17 @@ impl Browser {
                 self.go(first.unwrap_or(Place::Shared), requests);
             }
             self.spaces = Some(listing.spaces);
+        } else if let Place::Whole { space } = &listing.place {
+            if let Some((_, held)) = self.whole.as_mut().filter(|(sought, _)| sought == space) {
+                (*held, self.notice) = (Some(listing.entries), None);
+            }
         } else if !self.binned && self.place.as_ref() == Some(&listing.place) {
+            // What a merge changed in the folder it changed in the space that is searched.
+            // What is found stays until the answer comes.
+            if let (false, Some((space, _))) = (self.busy.is_empty(), &self.whole) {
+                let place = Place::Whole { space: space.clone() };
+                requests.push(Request::Browse { server: self.server.clone(), place });
+            }
             // The answer to a merge leaves the keyboard where the person has it.
             self.fresh |= self.busy.is_empty();
             self.answered(|id| listing.entries.iter().any(|entry| copy(entry).is_some_and(|(_, shared)| shared == id)));
@@ -208,7 +233,12 @@ impl Browser {
     /// a place that was left.
     pub fn refused(&mut self, why: &str) {
         let asked = if self.binned { self.thrown.is_none() } else { self.entries.is_none() };
-        if self.open && (asked || !self.busy.is_empty()) {
+        let searched = matches!(self.whole, Some((_, None)));
+        if self.open && (asked || searched || !self.busy.is_empty()) {
+            // A space that could not be read is asked for again when more is typed.
+            if searched {
+                self.whole = None;
+            }
             self.notice = Some(why.to_owned());
             self.answered(|_| true);
         }
@@ -268,7 +298,18 @@ impl Browser {
                 // The keyboard stays on the heading, to turn the order round with.
                 (self.chosen, self.fresh) = (Some((by, turned)), false);
             }
+            Browsing::Seek(sought) => {
+                (self.sought, self.fresh) = (sought, false);
+                self.seek(requests);
+            }
+            Browsing::Take => {
+                let best = self.found().and_then(|found| found.first().and_then(|entry| does(entry)));
+                if let Some(best) = best {
+                    self.update(best, servers, clock, requests);
+                }
+            }
             Browsing::Trash => {
+                self.unseek();
                 (self.binned, self.thrown, self.notice) = (true, None, None);
                 requests.push(Request::BrowseTrash { server: self.server.clone() });
             }
@@ -293,6 +334,8 @@ impl Browser {
     /// the person chooses. What was open lately stays in the order it was opened in.
     fn order(&self) -> Option<(Order, bool)> {
         match self.place {
+            // What a search found is listed best first.
+            _ if self.seeking() => None,
             Some(Place::Recent) | None => None,
             Some(_) => Some(self.chosen.unwrap_or((Order::Name, false))),
         }
@@ -324,8 +367,47 @@ impl Browser {
         (known.role >= Grade::Editor).then_some((space.as_str(), path.as_str()))
     }
 
+    /// Whether something is searched for.
+    fn seeking(&self) -> bool {
+        !self.binned && !Query::parse(&self.sought).is_empty()
+    }
+
+    /// Asks for everything in the space that is looked at, once, when something is searched for there.
+    /// What a search no longer needs is let go, so that the next one reads the space as it is then.
+    fn seek(&mut self, requests: &mut Vec<Request>) {
+        let space = match &self.place {
+            Some(Place::Folder { space, .. }) if self.seeking() => space,
+            _ => return self.whole = None,
+        };
+        if self.whole.as_ref().is_none_or(|(asked, _)| asked != space) {
+            self.whole = Some((space.clone(), None));
+            self.notice = None;
+            requests
+                .push(Request::Browse { server: self.server.clone(), place: Place::Whole { space: space.clone() } });
+        }
+    }
+
+    /// Ends a search.
+    fn unseek(&mut self) {
+        (self.whole, self.sought) = (None, String::new());
+    }
+
+    /// What the search found, the best first: in the whole space of a folder, or among the documents of
+    /// another place. `None` while nothing is searched for, and until the server has said what there is.
+    fn found(&self) -> Option<Vec<&Entry>> {
+        if !self.seeking() {
+            return None;
+        }
+        let among = match &self.place {
+            Some(Place::Folder { .. }) => self.whole.as_ref()?.1.as_deref()?,
+            _ => self.entries.as_deref()?,
+        };
+        Some(Query::parse(&self.sought).rank(among))
+    }
+
     /// Turns to a server, and asks what spaces the person has there.
     fn look(&mut self, server: String, requests: &mut Vec<Request>) {
+        self.unseek();
         (self.spaces, self.place, self.entries, self.notice, self.binned) = (None, None, None, None, false);
         requests.push(Request::Browse { server: server.clone(), place: Place::Spaces });
         self.server = server;
@@ -333,6 +415,7 @@ impl Browser {
 
     /// Turns to a place of the server, and asks what it holds.
     fn go(&mut self, place: Place, requests: &mut Vec<Request>) {
+        self.unseek();
         (self.entries, self.notice, self.binned) = (None, None, false);
         self.busy.clear();
         requests.push(Request::Browse { server: self.server.clone(), place: place.clone() });
@@ -390,6 +473,7 @@ impl Browser {
             .padding(Edges { top: tokens::SPACE_LG, ..Edges::all(tokens::SPACE_XL) })
             .child(head)
             .child(sources)
+            .child(self.field())
             .child(body);
         let dialog = Popover::new(content)
             .flush()
@@ -399,6 +483,32 @@ impl Browser {
             .open(true)
             .on_close(send(Browsing::Close));
         Some(Element::row().overlay().popover(dialog))
+    }
+
+    /// The field that finds documents: in every folder of the space that is looked at, or among what
+    /// another place lists. The trash is not searched.
+    fn field(&self) -> Element<Message> {
+        let space = match &self.place {
+            Some(Place::Folder { space, .. }) => {
+                self.spaces.as_deref().unwrap_or_default().iter().find(|known| known.id == *space)
+            }
+            _ => None,
+        };
+        let hint = match (&self.place, space) {
+            _ if self.binned => "Search".to_owned(),
+            (_, Some(space)) => format!("Search {} and its folders", space.name),
+            (Some(Place::Shared), _) => "Search what is shared with you".to_owned(),
+            (Some(Place::Recent), _) => "Search recent documents".to_owned(),
+            _ => "Search".to_owned(),
+        };
+        let field = TextField::new("Search", &self.sought)
+            .placeholder(hint)
+            .disabled(self.binned || self.place.is_none())
+            .on_input(|sought| send(Browsing::Seek(sought)))
+            .on_submit(send(Browsing::Take));
+        Element::from(field).description(
+            "Letters of a name or its folders, and filters such as author:sam, is:folder or before:2026-11-01",
+        )
     }
 
     /// The places of the server down the card's side: the person's spaces, then what reaches them from
@@ -450,7 +560,11 @@ impl Browser {
         // Why a place could not be read stands in place of what it holds, and why what was asked of a row
         // was not done stands over the list it is in.
         let pane = pane.children(self.notice.as_deref().map(|why| said(why, Role::Alert, tokens::DANGER)));
-        let known = if self.binned { self.thrown.is_some() } else { self.entries.is_some() };
+        let known = match (self.binned, self.seeking()) {
+            (true, _) => self.thrown.is_some(),
+            (false, true) => self.found().is_some(),
+            (false, false) => self.entries.is_some(),
+        };
         if self.notice.is_some() && !known {
             return pane;
         }
@@ -461,6 +575,27 @@ impl Browser {
                 Some([]) => pane.child(quietly("The trash is empty.")),
                 Some(thrown) => pane.child(gone_heads(room)).child(self.gone(thrown, today, room)),
             };
+        }
+        if self.seeking() {
+            let Some(found) = self.found() else { return pane.child(quietly(&loading)) };
+            if found.is_empty() {
+                return pane.child(quietly(NOTHING));
+            }
+            let rows = found.iter().take(FOUND).enumerate().map(|(at, entry)| {
+                let row = self.entry(entry, today, room, true);
+                if at == 0 { row.heir() } else { row }
+            });
+            let list = Element::column()
+                .grow(1.0)
+                .shrink()
+                .role(Role::ListBox)
+                .label("Documents")
+                .arrows(Dir::Column)
+                .one_stop()
+                .scroll()
+                .children(rows);
+            let more = (found.len() > FOUND).then(|| quietly(&format!("Showing the best {FOUND} of {}.", found.len())));
+            return pane.child(self.heads(room)).child(list).children(more);
         }
         let entries = match self.entries.as_deref() {
             None => return pane.child(quietly(&loading)),
@@ -477,7 +612,7 @@ impl Browser {
         // The first of them takes the keyboard as they come, so that a folder gone into with Enter is
         // walked on with the arrow keys.
         let rows = self.sorted(entries).into_iter().enumerate().map(|(at, entry)| {
-            let row = self.entry(entry, today, room);
+            let row = self.entry(entry, today, room, false);
             match at {
                 0 if self.fresh => row.takes_focus().heir(),
                 // The list is walked on from its top when the row that had the keyboard was merged away.
@@ -647,10 +782,10 @@ impl Browser {
 
     /// One folder or document of the place. A folder is gone into, a document is opened, and a file that
     /// could not be read as a document is only listed. So is a conflict copy, which goes by the id of the
-    /// document it is a copy of: whoever edits there merges it into that document from its row.
-    fn entry(&self, entry: &Entry, today: Option<i64>, room: Room) -> Element<Message> {
+    /// document it is a copy of: whoever edits there merges it into that document from its row. One that a
+    /// search `found` says what folder it is in.
+    fn entry(&self, entry: &Entry, today: Option<i64>, room: Room, found: bool) -> Element<Message> {
         let folder = entry.kind == EntryKind::Folder;
-        let copied = entry.tags.iter().any(|tag| matches!(tag, Tag::ConflictCopy { .. }));
         let merges = copy(entry).filter(|_| entry.role >= Grade::Editor);
         let waits = merges.is_some_and(|(_, id)| self.busy.iter().any(|row| row == id));
         let merge = merges.map(|(of, id)| {
@@ -663,16 +798,12 @@ impl Browser {
             }
         });
         let merged = merge.is_some();
-        let does = match (&entry.space, &entry.id) {
-            _ if copied => None,
-            (Some(space), _) if folder => {
-                Some(Browsing::Go(Place::Folder { space: space.clone(), path: entry.path.clone() }))
-            }
-            (_, Some(id)) if !folder => Some(Browsing::Open(id.clone())),
-            _ => None,
-        };
-        // The button says what the note would.
-        let noted = notes(&entry.tags, !merged);
+        let does = does(entry);
+        // Where it is comes first, and the button says what the note would.
+        let folders = entry.path.rsplit_once('/').filter(|_| found).map(|(folders, _)| folders.replace('/', " / "));
+        let noted = [folders.map(|folders| format!("In {folders}")), notes(&entry.tags, !merged)];
+        let noted: Vec<String> = noted.into_iter().flatten().collect();
+        let noted = (!noted.is_empty()).then(|| noted.join(", "));
         let called = |seconds: u64| day_called(day(seconds, self.zone), today);
         let made = entry.created.as_deref().and_then(seconds).map(called);
         let when = (!folder).then(|| called(entry.modified));
@@ -712,6 +843,23 @@ impl Browser {
         }
     }
 }
+
+/// What pressing an entry asks for: a folder is gone into and a document is opened. A conflict copy and a
+/// file that could not be read open nothing.
+fn does(entry: &Entry) -> Option<Browsing> {
+    let folder = entry.kind == EntryKind::Folder;
+    match (&entry.space, &entry.id) {
+        _ if entry.tags.iter().any(|tag| matches!(tag, Tag::ConflictCopy { .. })) => None,
+        (Some(space), _) if folder => {
+            Some(Browsing::Go(Place::Folder { space: space.clone(), path: entry.path.clone() }))
+        }
+        (_, Some(id)) if !folder => Some(Browsing::Open(id.clone())),
+        _ => None,
+    }
+}
+
+/// What stands in place of the list when a search found nothing.
+const NOTHING: &str = "Nothing here matches your search. Try fewer letters, or a filter such as author:sam, is:folder or before:2026-11-01.";
 
 /// What a conflict copy is a copy of: the path of its original, and the id the two share.
 fn copy(entry: &Entry) -> Option<(&str, &str)> {
