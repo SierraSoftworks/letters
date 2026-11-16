@@ -106,7 +106,8 @@ impl Room {
         copy.wary = true;
         let (journal, left) = Journal::open(state, &copy.id, &copy.created, Some(home))?;
         if let Some(left) = &left {
-            copy.replay(left)?;
+            // A journal with an edit that does not stand fails the room, as it did when replay failed whole.
+            copy.replay(left)?.whole()?;
         }
         Ok(Self {
             copy,

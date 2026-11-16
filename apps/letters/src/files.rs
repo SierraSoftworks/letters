@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-use letters_format::{Archive, Files, Save, Saved, Stamp, Unsaved, WorkingCopy};
+use letters_format::{Archive, Files, Replayed, Save, Saved, Stamp, Unsaved, WorkingCopy};
 use letters_model::{Block, BlockId, BlockKind, Document, Model, Notes, Prepared, ReplicaId, Revision, Style};
 
 use crate::journal::{self, Claim};
@@ -530,7 +530,9 @@ impl Rest {
             // app started, and has turned up since. The editor shows the file, so it merges what that adds.
             claim(&copy).filter(|claim| {
                 let file = copy.model().revision();
-                let Some(replayed) = claim.replay(|unsaved| copy.replay(unsaved)) else { return true };
+                let Some(replayed) = claim.replay(|unsaved| copy.replay(unsaved).and_then(Replayed::whole)) else {
+                    return true;
+                };
                 news = (copy.model().revision() != file).then(|| copy.model().updates_since(&file));
                 // A journal that builds on another file stays as it is, and this window keeps none.
                 replayed
@@ -596,14 +598,17 @@ pub fn reopen(claim: Claim) -> Option<Opened> {
         if copy.id != unsaved.id {
             copy.fork(unsaved.id.clone());
         }
-        let added = copy.replay(unsaved).ok()?;
+        let added = copy.replay(unsaved).and_then(Replayed::whole).ok()?;
         Some((Home { path: path.into(), written: true }, copy, added))
     };
     let back = claim.replay(|unsaved| match on_file(unsaved) {
         Some((_, _, false)) => Some(None),
         Some((home, copy, true)) => Some(Some((Some(home), copy))),
         // With no file to add to, the journal has to hold the whole document.
-        None => WorkingCopy::recover(unsaved, replica()).ok()?.map(|copy| Some((None, copy))),
+        None => {
+            let (copy, replayed) = WorkingCopy::recover(unsaved, replica()).ok()??;
+            replayed.whole().ok().map(|_| Some((None, copy)))
+        }
     })?;
     let Some(back) = back? else {
         claim.discard();

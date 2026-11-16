@@ -3,7 +3,7 @@
 mod common;
 
 use common::{Folder, ID, open, paragraph};
-use letters_format::{Error, Journal, Save, Saved, Unsaved, WorkingCopy, is_journal, journal_name, save};
+use letters_format::{Error, Journal, Replayed, Save, Saved, Unsaved, WorkingCopy, is_journal, journal_name, save};
 use letters_model::{
     Anchor, BlockId, Document, Model, Note, NoteKind, Notes, Op, Pos, ReplicaId, Revision, Run, Style,
 };
@@ -60,7 +60,7 @@ impl Session {
     fn open(folder: &Folder, state: &mut Folder, replica: u64) -> Self {
         let mut copy = WorkingCopy::open(&mut open(&folder.files[NAME]), ReplicaId::from(replica)).unwrap();
         let (journal, unsaved) = Journal::open(state, &copy.id, &copy.created, Some(NAME)).unwrap();
-        let recovered = unsaved.is_some_and(|unsaved| copy.replay(&unsaved).unwrap());
+        let recovered = unsaved.is_some_and(|unsaved| copy.replay(&unsaved).unwrap().whole().unwrap());
         let editor = Model::load(&copy.model().save(), ReplicaId::from(replica + 100)).unwrap();
         Self { journalled: editor.revision(), editor, copy, journal, recovered }
     }
@@ -81,6 +81,21 @@ impl Session {
         saved
     }
 }
+
+/// The document of a journal that holds one whole.
+fn recovered(unsaved: &Unsaved) -> (WorkingCopy, Replayed) {
+    WorkingCopy::recover(unsaved, ReplicaId::from(3)).unwrap().expect("the journal stands alone")
+}
+
+/// Edits the model refuses, by what is wrong with them. The histories are ones fuzzing found.
+const REFUSED: [(&str, &[u8]); 3] = [
+    ("no history", b"not a history"),
+    (
+        "edits Loro panics on as they land",
+        include_bytes!("../../../fuzz/corpus/history/a-first-edit-that-builds-on-one-before-it.bin"),
+    ),
+    ("a history Loro overflows on", include_bytes!("../../../fuzz/corpus/history/a-history-whose-mark-overflows.bin")),
+];
 
 #[test]
 fn a_document_that_never_reached_a_file_comes_back_from_its_journal() {
@@ -105,7 +120,8 @@ fn a_document_that_never_reached_a_file_comes_back_from_its_journal() {
     let unsaved = Unsaved::read(&mut state, &names[0]).unwrap().unwrap();
     assert_eq!((unsaved.id.as_str(), unsaved.created.as_str(), unsaved.home.as_deref()), (ID, CREATED, None));
 
-    let copy = WorkingCopy::recover(&unsaved, ReplicaId::from(3)).unwrap().expect("the journal stands alone");
+    let (copy, replayed) = recovered(&unsaved);
+    assert_eq!(replayed.refused, None);
     assert_eq!(text(copy.model().doc()), "Draft: A title. Hello world");
     assert_eq!(copy.entries.get("assets/a.png"), Some(&vec![1; 8]));
     assert_eq!(copy.notes.notes.len(), 1);
@@ -123,7 +139,7 @@ fn a_home_chosen_before_the_first_write_keeps_the_journal_whole() {
     // The crash comes before the first save, so there is no file at that home to add to.
     let unsaved = Unsaved::read(&mut state, &journal_name(ID)).unwrap().unwrap();
     assert_eq!(unsaved.home.as_deref(), Some(NAME));
-    let copy = WorkingCopy::recover(&unsaved, ReplicaId::from(3)).unwrap().expect("the journal stands alone");
+    let (copy, _) = recovered(&unsaved);
     assert_eq!(text(copy.model().doc()), "A title. Hello world");
 }
 
@@ -218,7 +234,7 @@ fn a_journal_is_only_replayed_into_the_document_it_was_kept_for() {
     drop(session);
     let unsaved = Unsaved::read(&mut state, &journal_name(ID)).unwrap().unwrap();
     assert_eq!((unsaved.home.as_deref(), unsaved.whole), (Some(NAME), false));
-    assert_eq!(WorkingCopy::recover(&unsaved, ReplicaId::from(3)).unwrap().map(|copy| copy.id), None);
+    assert!(WorkingCopy::recover(&unsaved, ReplicaId::from(3)).unwrap().is_none());
 
     let other = Document { blocks: vec![paragraph("p", "Something else")], ..Document::default() };
     type Expected = fn(&Error) -> bool;
@@ -265,10 +281,56 @@ fn a_copy_that_became_its_own_document_comes_back_under_its_new_id() {
     let mut copy = WorkingCopy::open(&mut open(&folder.files[NAME]), ReplicaId::from(3)).unwrap();
     assert!(matches!(copy.replay(&unsaved), Err(Error::OtherDocument(_))), "not while it goes by the old id");
     copy.fork(unsaved.id.clone());
-    assert!(copy.replay(&unsaved).unwrap());
+    assert!(copy.replay(&unsaved).unwrap().added);
     assert_eq!(text(copy.model().doc()), "Mine. Hello world");
 
     let mut folder = folder;
     assert!(matches!(save(&mut folder, &mut copy, &SAVE).unwrap(), Saved::Written));
     assert_eq!(open(&folder.files[NAME]).manifest().id, "a-new-id");
+}
+
+#[test]
+fn a_journal_comes_back_up_to_the_first_edit_that_does_not_stand() {
+    let cases = REFUSED.iter().flat_map(|refused| [(refused, false), (refused, true)]);
+    for ((why, refused), wary) in cases {
+        let (folder, mut state) = (shared(), Folder::default());
+        let mut session = Session::open(&folder, &mut state, 2);
+        session.write(&mut state, "one ");
+        session.journal.edits(&mut state, refused).unwrap();
+        // These build on nothing of the refused edits, so they would stand if they were tried.
+        session.write(&mut state, "two ");
+        session.journal.notes(&mut state, &note("n")).unwrap();
+        drop(session);
+
+        let unsaved = Unsaved::read(&mut state, &journal_name(ID)).unwrap().unwrap();
+        let mut copy = WorkingCopy::open(&mut open(&folder.files[NAME]), ReplicaId::from(3)).unwrap();
+        copy.wary = wary;
+        let replayed = copy.replay(&unsaved).expect(why);
+        assert_eq!(text(copy.model().doc()), "one Hello world", "{why}: nothing after it is taken in");
+        assert_eq!((replayed.edits, replayed.of), (1, 3), "{why}");
+        assert!(replayed.added && replayed.refused.is_some(), "{why}: {replayed:?}");
+        assert_eq!(copy.notes.notes.len(), 1, "{why}: the notes come back");
+        assert!(matches!(replayed.whole(), Err(Error::History(_))), "{why}");
+    }
+}
+
+#[test]
+fn a_document_with_no_file_comes_back_up_to_the_first_edit_that_does_not_stand() {
+    for (why, refused) in REFUSED {
+        let mut state = Folder::default();
+        let mut editor = Model::new(document(), ReplicaId::from(2));
+        let (mut journal, _) = Journal::open(&mut state, ID, CREATED, None).unwrap();
+        editor.apply([Op::InsertText { at: Pos::new("p", 0), text: "A title. ".into() }]).unwrap();
+        journal.edits(&mut state, &editor.save()).unwrap();
+        journal.edits(&mut state, refused).unwrap();
+        let journalled = editor.revision();
+        editor.apply([Op::InsertText { at: Pos::new("p", 0), text: "Draft: ".into() }]).unwrap();
+        journal.edits(&mut state, &editor.updates_since(&journalled)).unwrap();
+
+        let unsaved = Unsaved::read(&mut state, &journal_name(ID)).unwrap().unwrap();
+        let (copy, replayed) = recovered(&unsaved);
+        assert_eq!(text(copy.model().doc()), "A title. Hello world", "{why}");
+        assert_eq!((replayed.edits, replayed.of), (1, 3), "{why}");
+        assert!(replayed.refused.is_some(), "{why}");
+    }
 }

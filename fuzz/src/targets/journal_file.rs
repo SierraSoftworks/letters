@@ -6,6 +6,7 @@ use letters_model::{Model, Style};
 use sha2::{Digest, Sha256};
 
 use super::history::sealed;
+use crate::checks::sound;
 use crate::edits::{ops, sample, shown};
 use crate::folder::Folder;
 use crate::input::{Script, put};
@@ -42,7 +43,11 @@ pub fn run(data: &[u8]) {
     let Ok(Some(unsaved)) = Unsaved::read(&mut state, "found.journal") else { return };
     let _ = WorkingCopy::recover(&unsaved, 5.into());
     let mut copy = WorkingCopy::new(&*unsaved.id, &*unsaved.created, sample(), Style::default(), 6.into());
-    let _ = copy.replay(&unsaved);
+    if let Ok(replayed) = copy.replay(&unsaved) {
+        // A replay that stops part way says why, and what came back before it is a document like any other.
+        assert_eq!(replayed.refused.is_some(), replayed.edits < replayed.of, "a replay stopped unsaid: {replayed:?}");
+        sound(copy.model().doc(), "a document a journal was replayed onto");
+    }
 
     // The same file under its document's name is the journal of that document.
     let name = journal_name(&unsaved.id);

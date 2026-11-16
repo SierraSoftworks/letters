@@ -4,7 +4,7 @@
 
 use std::io::Cursor;
 
-use letters_format::{Archive, Journal, Save, Saved, Unsaved, WorkingCopy, journal_name, save};
+use letters_format::{Archive, Journal, Replayed, Save, Saved, Unsaved, WorkingCopy, journal_name, save};
 use letters_model::{Model, Revision, Style};
 
 use crate::edits::{ops, sample, shown};
@@ -37,14 +37,16 @@ impl Session {
             (Some(mut file), unsaved) => {
                 let mut copy = WorkingCopy::open(&mut file, replica.into()).expect("a saved file opens");
                 if let Some(unsaved) = &unsaved {
-                    copy.replay(unsaved).expect("a journal replays onto the file it was kept for");
+                    let replayed = copy.replay(unsaved).and_then(Replayed::whole);
+                    replayed.expect("a journal replays onto the file it was kept for");
                 }
                 let sent = copy.model().revision();
                 (copy, Some(sent))
             }
             (None, Some(unsaved)) => {
                 let copy = WorkingCopy::recover(&unsaved, replica.into()).expect("a journal that stands alone is read");
-                let copy = copy.expect("the journal of a document with no file stands alone");
+                let (copy, replayed) = copy.expect("the journal of a document with no file stands alone");
+                assert_eq!(replayed.refused, None, "a session's own journal holds an edit that does not stand");
                 let sent = copy.model().revision();
                 (copy, Some(sent))
             }

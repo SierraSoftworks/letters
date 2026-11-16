@@ -25,6 +25,28 @@ pub const OPLOG: &str = "history/oplog";
 /// [`WorkingCopy::check`].
 pub type Check = fn(&[u8]) -> Result<(), HistoryError>;
 
+/// How far [`WorkingCopy::replay`] got with a journal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Replayed {
+    /// Whether the journal held anything the copy lacked, which is then owed a save.
+    pub added: bool,
+    /// How many of the journal's edits the document now holds, counted from the first.
+    pub edits: usize,
+    /// How many edits the journal holds.
+    pub of: usize,
+    /// Why the replay stopped part way: the model refused the edit after the last that came back, and
+    /// that edit and every one after it were left out. `None` when every edit came back.
+    pub refused: Option<HistoryError>,
+}
+
+impl Replayed {
+    /// Whether the journal held anything new, for a caller that takes a journal whole or not at all: a
+    /// replay that stopped part way is the model's refusal.
+    pub fn whole(self) -> Result<bool, Error> {
+        self.refused.map_or(Ok(self.added), |refused| Err(Error::History(refused)))
+    }
+}
+
 /// A document in memory between saves. It is the [`Replica`] that [`save`](crate::save) writes.
 pub struct WorkingCopy {
     pub id: String,
@@ -362,63 +384,76 @@ fn stood(held: &Document, now: &Model, block: &BlockId) -> Option<Stood> {
 
 impl WorkingCopy {
     /// Takes in what a journal kept from a session that ended before its edits were known to be in the
-    /// file. Returns whether it held anything this copy lacked, which is then owed a save.
+    /// file, and tells how far it got.
+    ///
+    /// Every copy tries the edits with [`Model::admit`] before it merges them: a journal is read after a
+    /// crash, which its last record may have caused. The edits that stand come back in order. At the
+    /// first the model refuses the replay stops, and neither that edit nor any after it is taken in. The
+    /// journal's notes and assets come back either way.
     ///
     /// Fails with [`Error::Unmerged`] when the journal's edits build on a history this copy does not hold.
-    /// A [wary](Self::wary) copy fails with [`Error::History`] there, and has taken none of them in.
-    ///
-    /// Every copy tries the edits with [`Model::admit`] before it merges them, and fails with
-    /// [`Error::History`] on edits that do not stand: a journal is read after a crash, which its last
-    /// record may have caused.
-    pub fn replay(&mut self, unsaved: &Unsaved) -> Result<bool, Error> {
+    /// To a [wary](Self::wary) copy that is a refusal like any other.
+    pub fn replay(&mut self, unsaved: &Unsaved) -> Result<Replayed, Error> {
         if unsaved.id != self.id {
             return Err(Error::OtherDocument(unsaved.id.clone()));
         }
         let held = |model: &Model, edits: &[u8]| {
-            let held = model.compare(edits).map_err(Error::History)?;
-            Ok::<_, Error>(matches!(held, Some(Ordering::Greater | Ordering::Equal)))
+            Ok::<_, HistoryError>(matches!(model.compare(edits)?, Some(Ordering::Greater | Ordering::Equal)))
         };
-        let mut added = false;
-        self.notes.pin(&self.model);
-        for edits in &unsaved.edits {
-            if held(&self.model, edits)? {
-                continue;
+        let wary = self.wary;
+        let take = |model: &mut Model, edits: &[u8]| {
+            if held(model, edits)? {
+                return Ok(false);
             }
-            // Tried whoever wrote them: what ended the session may be what the journal last took down.
-            match self.model.admit(edits) {
+            match model.admit(edits) {
                 // A copy that is not wary tells of these below, as it did when it let them wait.
-                Err(HistoryError::Lacking) if !self.wary => continue,
-                tried => tried.map_err(Error::History)?,
+                Err(HistoryError::Lacking) if !wary => return Ok(false),
+                tried => tried?,
             }
-            self.model.merge(edits).map_err(Error::History)?;
-            added = true;
+            model.merge(edits)?;
+            Ok::<_, HistoryError>(true)
+        };
+        let of = unsaved.edits.len();
+        let mut replayed = Replayed { added: false, edits: of, of, refused: None };
+        self.notes.pin(&self.model);
+        for (index, edits) in unsaved.edits.iter().enumerate() {
+            match take(&mut self.model, edits) {
+                Ok(added) => replayed.added |= added,
+                Err(refused) => {
+                    (replayed.edits, replayed.refused) = (index, Some(refused));
+                    break;
+                }
+            }
         }
         if !self.wary {
             // This copy tries nothing else, and need not keep the model's second history for it.
             self.model.release_copy();
         }
         // Edits that wait for others the copy never saw are not in the document.
-        for edits in &unsaved.edits {
-            if !held(&self.model, edits)? {
+        for edits in &unsaved.edits[..replayed.edits] {
+            if !held(&self.model, edits).map_err(Error::History)? {
                 return Err(Error::Unmerged);
             }
         }
         if let Some(notes) = &unsaved.notes {
-            added |= self.notes.merge(notes);
+            replayed.added |= self.notes.merge(notes);
         }
         self.notes.follow(&self.model);
         for (name, bytes) in &unsaved.assets {
             if !self.entries.contains_key(name) && !self.seen.contains_key(name) {
                 self.entries.insert(name.clone(), bytes.clone());
-                added = true;
+                replayed.added = true;
             }
         }
-        Ok(added)
+        Ok(replayed)
     }
 
     /// The document a journal holds on its own, for one that never reached a file or whose file is gone.
     /// `None` when the journal only adds to a file.
-    pub fn recover(unsaved: &Unsaved, replica: ReplicaId) -> Result<Option<Self>, Error> {
+    ///
+    /// It comes back as far as [`Self::replay`] gets, which the answer tells beside it. Fails with
+    /// [`Error::History`] when the journal's first edits, which hold the document, do not stand.
+    pub fn recover(unsaved: &Unsaved, replica: ReplicaId) -> Result<Option<(Self, Replayed)>, Error> {
         let Some(first) = unsaved.edits.first().filter(|_| unsaved.whole) else { return Ok(None) };
         // A journal is read after a crash, which may be why it ended: it is checked whoever wrote it.
         Model::check(first).map_err(Error::History)?;
@@ -436,9 +471,9 @@ impl WorkingCopy {
             wary: true,
             check: Model::check,
         };
-        copy.replay(unsaved)?;
+        let replayed = copy.replay(unsaved)?;
         copy.wary = false;
-        Ok(Some(copy))
+        Ok(Some((copy, replayed)))
     }
 }
 
