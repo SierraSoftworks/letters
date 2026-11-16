@@ -1,12 +1,15 @@
 //! The native calls winit does not make. This is the one crate of Letters that may use `unsafe`, and it
 //! holds nothing else.
 //!
-//! Besides the window calls it maps font files into memory ([`map_font`]), which is unsafe for any crate.
+//! Besides the window calls it maps font files into memory ([`map_font`]), which is unsafe for any crate,
+//! and asks macOS to download files a sync app keeps in the cloud ([`fetch_cloud_files`]).
 //!
 //! Every call is optional and is there on every system. Each says whether it worked, and where one did
 //! not the app runs as it would without this crate: square corners and no shadow of its own on Wayland, a
 //! title bar of the usual height on macOS.
 
+#[cfg(target_os = "macos")]
+mod cloud;
 #[cfg(target_os = "macos")]
 mod macos;
 mod map;
@@ -16,10 +19,18 @@ mod print;
 pub mod wayland;
 
 #[cfg(target_os = "macos")]
+pub use cloud::fetch_cloud_files;
+#[cfg(target_os = "macos")]
 pub use macos::{lights, unify_title_bar};
 pub use map::{Mapped, map_font};
 #[cfg(target_os = "macos")]
 pub use print::print_pdf;
+
+/// Only macOS holds a cloud file back from a process. Nothing is asked, and `true` says none is held back.
+#[cfg(not(target_os = "macos"))]
+pub fn fetch_cloud_files() -> bool {
+    true
+}
 
 /// Only macOS has the print sheet this asks for. Nothing is shown, and `false` says so.
 #[cfg(not(target_os = "macos"))]
