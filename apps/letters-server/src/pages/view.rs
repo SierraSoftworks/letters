@@ -300,7 +300,7 @@ fn tag(tag: &api::Tag) -> Html {
 
 /// One row. `here` is the page the table is on, which a question about the row is asked over, and `None`
 /// where a table asks none. `shares` is whether the person says who the row is shared with.
-fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
+fn file(row: &Row, here: Option<&str>, places: bool, shares: bool, also: &[&str]) -> Html {
     let entry = &row.entry;
     let space = entry.space.as_deref().unwrap_or_default();
     // A conflict copy has the id of its original, so whatever is asked by id is asked of the original.
@@ -341,7 +341,14 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
             </form>
         }
     });
-    let class = if loose == Some(true) { "lt-file lt-file--under" } else { "lt-file" };
+    // The same writing in other formats, named under the pointer.
+    let formats = (!also.is_empty()).then(|| {
+        html! {
+            <Tooltip tip={format!("Also kept as {}", also.join(", "))}>
+                <Tag icon={icons::COPY}>{ format!("+{}", also.len()) }</Tag>
+            </Tooltip>
+        }
+    });
     let name = match href {
         Some(href) => html! { <a class="lt-file__name" {href}>{ entry.name.clone() }</a> },
         None => html! { <span class="lt-file__name">{ entry.name.clone() }</span> },
@@ -401,7 +408,7 @@ fn file(row: &Row, here: Option<&str>, places: bool, shares: bool) -> Html {
     html! {
         <tr class="yi-table__row">
             <th scope="row">
-                <span {class}><Icon {icon} />{ name }{ for tags.map(tag) }{ for merge }{ for import }</span>
+                <span class="lt-file"><Icon {icon} />{ name }{ for formats }{ for tags.map(tag) }{ for merge }{ for import }</span>
             </th>
             if places {
                 <td class="lt-dim">{ row.space.clone().unwrap_or_default() }</td>
@@ -445,6 +452,19 @@ fn folder(folder: &Folder) -> Html {
     } else {
         Html::default()
     };
+    // A file with the name of a document has no row of its own: the document's row names it.
+    let under = |row: &Row| {
+        let beside = row.entry.tags.iter().find_map(|tag| match tag {
+            api::Tag::Unimported { beside } => beside.as_deref(),
+            _ => None,
+        })?;
+        folder.rows.iter().find(|above| above.entry.id.is_some() && above.entry.path == beside)
+    };
+    let rows = folder.rows.iter().filter(|row| under(row).is_none()).map(|row| {
+        let files = folder.rows.iter().filter(|file| under(file).is_some_and(|above| std::ptr::eq(above, row)));
+        let also: Vec<&str> = files.map(|file| file.entry.name.as_str()).collect();
+        file(row, Some(&here), false, folder.shares, &also)
+    });
     let table = if folder.rows.is_empty() {
         html! {
             <EmptyState title="Nothing here yet" icon={icons::FOLDER_OPEN}>
@@ -455,7 +475,7 @@ fn folder(folder: &Folder) -> Html {
         html! {
             <SimpleTable label="Documents" variant={TableVariant::Ruled}>
                 { headings(None) }
-                <tbody>{ for folder.rows.iter().map(|row| file(row, Some(&here), false, folder.shares)) }</tbody>
+                <tbody>{ for rows }</tbody>
             </SimpleTable>
         }
     };
@@ -576,7 +596,7 @@ fn recent(rows: &[Row]) -> Html {
             } else {
                 <SimpleTable label="Documents opened lately" variant={TableVariant::Ruled}>
                     { headings(Some("In")) }
-                    <tbody>{ for rows.iter().map(|row| file(row, None, true, false)) }</tbody>
+                    <tbody>{ for rows.iter().map(|row| file(row, None, true, false, &[])) }</tbody>
                 </SimpleTable>
             }
         </Stack>
@@ -594,7 +614,7 @@ fn shared(rows: &[Row]) -> Html {
             } else {
                 <SimpleTable label="Documents shared with you" variant={TableVariant::Ruled}>
                     { headings(Some("From")) }
-                    <tbody>{ for rows.iter().map(|row| file(row, None, true, false)) }</tbody>
+                    <tbody>{ for rows.iter().map(|row| file(row, None, true, false, &[])) }</tbody>
                 </SimpleTable>
             }
         </Stack>
