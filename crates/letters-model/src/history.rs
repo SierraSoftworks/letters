@@ -4,8 +4,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use std::cmp::Ordering;
+use std::panic;
 
-use loro::{Frontiers, ID, LoroDoc, VersionVector};
+use loro::{Frontiers, ID, ImportBlobMetadata, LoroDoc, VersionVector};
 use sha2::{Digest, Sha256};
 
 /// One writer of a document.
@@ -82,8 +83,7 @@ impl Extent {
 
     /// How far the edits in a saved history or an update reach, for each writer with edits in it.
     pub fn of(history: &[u8]) -> Result<Self, HistoryError> {
-        let read = LoroDoc::decode_import_blob_meta(history, true);
-        read.map(|meta| Self(meta.partial_end_vv)).map_err(|error| HistoryError::Unreadable(error.to_string()))
+        told(history).map(|told| Self(told.partial_end_vv))
     }
 
     /// Takes in what `other` tells of, as a history does that merges the other.
@@ -114,11 +114,23 @@ impl PartialOrd for Extent {
     }
 }
 
+/// What a saved history or an update says of itself, read without a document.
+///
+/// Loro panics on some bytes as it reads this. No document is held meanwhile, so nothing is left poisoned,
+/// and the panic is answered as an error wherever panics unwind.
+pub(crate) fn told(history: &[u8]) -> Result<ImportBlobMetadata, HistoryError> {
+    let read = panic::catch_unwind(|| LoroDoc::decode_import_blob_meta(history, true));
+    let read = read.map_err(|_| HistoryError::Unreadable("reading it panicked".into()))?;
+    read.map_err(|error| HistoryError::Unreadable(error.to_string()))
+}
+
 /// Why a history was refused. The model is left as it was.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryError {
     /// The bytes are not a history, or are damaged.
     Unreadable(String),
+    /// The edits build on others that this history lacks. They can be taken in once it holds those.
+    Lacking,
     /// The history does not reach back, or forward, to this revision.
     UnknownRevision,
 }
@@ -127,6 +139,7 @@ impl fmt::Display for HistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unreadable(why) => write!(f, "the history cannot be read: {why}"),
+            Self::Lacking => f.write_str("the edits build on others that the history lacks"),
             Self::UnknownRevision => f.write_str("the history does not hold this revision"),
         }
     }

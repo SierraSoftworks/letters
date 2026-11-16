@@ -22,7 +22,7 @@ use crate::conflict::{self, Conflict};
 use crate::crdt::{self, Assign, Event, attrs};
 use crate::doc::line;
 use crate::flat::{self, BLOCK, DEPTH, Entry, Flat, children, head, insert, marker, nth, nth_mut, spell};
-use crate::history::{Extent, HistoryError, Hold, ReplicaId, Revision, StablePos};
+use crate::history::{Extent, HistoryError, Hold, ReplicaId, Revision, StablePos, told};
 use crate::undo::{Delta, Edit, Script, Step, Steps, is_skip};
 use crate::versions::{self, Point, Tag, TagKind};
 use crate::{
@@ -401,9 +401,10 @@ impl Model {
     /// again, or that a replica reads differently once it is saved, and merging one costs a room its
     /// document.
     ///
-    /// An update that builds on edits this history lacks is refused, so none waits unseen in the
-    /// document. The copy is made by the first call, keeps up with the document, and is a second history
-    /// in memory. Like [`Model::check`], this contains a panic only where panics unwind.
+    /// An update that builds on edits this history lacks is refused as [`HistoryError::Lacking`], so none
+    /// waits unseen in the document. The copy is made by the first call, keeps up with the document, and
+    /// is a second history in memory until [`Model::release_copy`]. Like [`Model::check`], this contains
+    /// a panic only where panics unwind.
     pub fn admit(&self, update: &[u8]) -> Result<(), HistoryError> {
         /// The edits an import names, by the replica that wrote them.
         fn spans<'a>(ranges: impl IntoIterator<Item = &'a VersionRange>) -> BTreeMap<u64, (i32, i32)> {
@@ -427,7 +428,7 @@ impl Model {
             let before = copy.oplog_vv();
             let took = copy.import(update).map_err(unreadable)?;
             if took.pending.is_some() {
-                return Err(unreadable("it builds on edits this history lacks"));
+                return Err(HistoryError::Lacking);
             }
             let wrote = copy.export(ExportMode::updates(&before)).map_err(unreadable)?;
             let wrote = scratch.import(&wrote).map_err(unreadable)?;
@@ -442,6 +443,12 @@ impl Model {
             *guard = Some(copy);
         }
         tried
+    }
+
+    /// Gives up the copy that [`Model::admit`] tries updates on, and the memory it holds, for a document
+    /// that has no more to try. The next [`Model::admit`] makes the copy again.
+    pub fn release_copy(&mut self) {
+        *self.guard.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// The model of a history, showing the revision the history shows.
@@ -935,15 +942,19 @@ impl Model {
 
     /// How this history stands to a saved one: `Greater` holds everything in it and more, `Less` lacks
     /// some of it, and `None` means each holds edits the other lacks.
+    ///
+    /// Only what the saved history says of itself is read, and no document reads it. So bytes from
+    /// anywhere can be asked about: a panic inside Loro as it reads them is an error here, where panics
+    /// unwind. The same holds for [`Model::related`] and [`Extent::of`].
     pub fn compare(&self, history: &[u8]) -> Result<Option<Ordering>, HistoryError> {
-        let other = LoroDoc::decode_import_blob_meta(history, true).map_err(unreadable)?;
+        let other = told(history)?;
         Ok(self.loro().oplog_vv().partial_cmp(&other.partial_end_vv))
     }
 
     /// Whether a saved history and this one hold an edit in common, as two that began as one file do.
     /// Histories that hold none still merge, into a document with everything from both.
     pub fn related(&self, history: &[u8]) -> Result<bool, HistoryError> {
-        let other = LoroDoc::decode_import_blob_meta(history, true).map_err(unreadable)?;
+        let other = told(history)?;
         let ours = self.loro().oplog_vv();
         let shared = |(peer, end): (&u64, &i32)| *end > 0 && ours.get(peer).is_some_and(|held| *held > 0);
         Ok(other.partial_end_vv.iter().any(shared))

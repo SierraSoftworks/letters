@@ -53,7 +53,7 @@ pub struct WorkingCopy {
     /// Whether histories that reach this copy are taken for a stranger's: the file's as a save merges it,
     /// another file's, edits, and a journal's. Each is then read with [`Model::check`] before a model
     /// loads it, and tried with [`Model::admit`] before this one merges it. Off for a person's own
-    /// documents, which open and merge at no added cost.
+    /// documents, which open and merge at no added cost. A journal's edits alone are tried by every copy.
     ///
     /// One that is refused is never merged: a save sets its file aside as damaged, and the other calls
     /// fail with [`Error::History`]. Edits that build on others this copy lacks are refused too, where a
@@ -366,6 +366,10 @@ impl WorkingCopy {
     ///
     /// Fails with [`Error::Unmerged`] when the journal's edits build on a history this copy does not hold.
     /// A [wary](Self::wary) copy fails with [`Error::History`] there, and has taken none of them in.
+    ///
+    /// Every copy tries the edits with [`Model::admit`] before it merges them, and fails with
+    /// [`Error::History`] on edits that do not stand: a journal is read after a crash, which its last
+    /// record may have caused.
     pub fn replay(&mut self, unsaved: &Unsaved) -> Result<bool, Error> {
         if unsaved.id != self.id {
             return Err(Error::OtherDocument(unsaved.id.clone()));
@@ -377,11 +381,21 @@ impl WorkingCopy {
         let mut added = false;
         self.notes.pin(&self.model);
         for edits in &unsaved.edits {
-            self.admit(edits)?;
-            if !held(&self.model, edits)? {
-                self.model.merge(edits).map_err(Error::History)?;
-                added = true;
+            if held(&self.model, edits)? {
+                continue;
             }
+            // Tried whoever wrote them: what ended the session may be what the journal last took down.
+            match self.model.admit(edits) {
+                // A copy that is not wary tells of these below, as it did when it let them wait.
+                Err(HistoryError::Lacking) if !self.wary => continue,
+                tried => tried.map_err(Error::History)?,
+            }
+            self.model.merge(edits).map_err(Error::History)?;
+            added = true;
+        }
+        if !self.wary {
+            // This copy tries nothing else, and need not keep the model's second history for it.
+            self.model.release_copy();
         }
         // Edits that wait for others the copy never saw are not in the document.
         for edits in &unsaved.edits {

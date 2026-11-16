@@ -224,19 +224,42 @@ fn a_history_no_writer_makes_is_stopped_by_the_check_or_changes_nothing() {
     assert_eq!(Model::load(&m.save(), ReplicaId::from(2)).unwrap().doc(), m.doc());
 }
 
+/// Found by fuzzing a journal: one edit that says it is its writer's first, and that it builds on that
+/// writer's edit before it. Loro panics on it in every document that lacks the writer.
+const FIRST_EDIT_ON_ONE_BEFORE: &[u8] =
+    include_bytes!("../../../fuzz/corpus/history/a-first-edit-that-builds-on-one-before-it.bin");
+
 /// Found by fuzzing, each with a sound checksum. Loro reads the first and then writes out a history it
-/// cannot read. It panics on the second, which poisons the document that was reading it.
+/// cannot read. It panics on the others, which poisons the document that was reading them.
 #[test]
 fn the_check_refuses_a_history_that_loro_cannot_keep() {
-    let cases: [(&str, &[u8]); 2] = [
+    let cases: [(&str, &[u8]); 3] = [
         ("its save cannot be read", include_bytes!("../../../fuzz/corpus/history/a-history-loro-cannot-write-out.bin")),
         ("Loro panics on it", include_bytes!("../../../fuzz/corpus/history/a-history-loro-panics-on.bin")),
+        ("Loro panics on its one edit", FIRST_EDIT_ON_ONE_BEFORE),
     ];
     for (name, history) in cases {
         assert!(matches!(Model::check(history), Err(HistoryError::Unreadable(_))), "{name}");
     }
-    let (a, _) = pair();
+    let (a, b) = pair();
     assert_eq!(Model::check(&a.save()), Ok(()), "a history is read after one that was refused");
+    // A document that lacks the edit's writer is spared it too, and goes on.
+    assert!(matches!(b.admit(FIRST_EDIT_ON_ONE_BEFORE), Err(HistoryError::Unreadable(_))));
+    assert_eq!(b.admit(&a.save()), Ok(()));
+}
+
+/// Found by fuzzing a journal. Loro panics as it reads what the history says of itself, where overflow is
+/// checked, and no document is there to be poisoned.
+#[test]
+fn a_history_loro_panics_on_before_any_document_reads_it_is_refused_by_all_that_read_it() {
+    let odd: &[u8] = include_bytes!("../../../fuzz/corpus/history/a-history-whose-mark-overflows.bin");
+    let (a, _) = pair();
+    assert!(matches!(a.compare(odd), Err(HistoryError::Unreadable(_))));
+    assert!(matches!(a.related(odd), Err(HistoryError::Unreadable(_))));
+    assert!(matches!(Extent::of(odd), Err(HistoryError::Unreadable(_))));
+    assert!(matches!(Model::check(odd), Err(HistoryError::Unreadable(_))));
+    assert!(matches!(a.admit(odd), Err(HistoryError::Unreadable(_))));
+    assert_eq!(a.compare(&a.save()), Ok(Some(Ordering::Equal)), "a history is compared after one that was refused");
 }
 
 /// What a device wrote since it held `held`, as it sends it to a room.
@@ -253,13 +276,14 @@ fn a_room_admits_what_a_device_writes_in_order_and_refuses_a_gap() {
     let bold = Op::SetMark { block: id("p"), range: 0..3, mark: Mark::Bold, on: true };
     let second = sent(&mut device, vec![split("p", 5, "p2"), bold]);
 
-    assert!(matches!(room.admit(&second), Err(HistoryError::Unreadable(_))), "an update with a gap before it");
+    assert_eq!(room.admit(&second), Err(HistoryError::Lacking), "an update with a gap before it");
     assert!(matches!(room.admit(b"not an update"), Err(HistoryError::Unreadable(_))));
     for update in [&first, &second] {
         assert_eq!(room.admit(update), Ok(()));
         room.merge(update).unwrap();
-        // The room writes as well, and the next update is tried on a copy that holds it.
+        // The room writes as well, and the next update is tried on a copy that holds it, or on a new one.
         room.apply([typed("p", 0, "r")]).unwrap();
+        room.release_copy();
     }
     device.merge(&room.save()).unwrap();
     assert_eq!(room.doc(), device.doc());
@@ -339,7 +363,7 @@ fn an_update_to_the_history_a_model_gave_up_is_not_admitted() {
 
     // The file's history takes the place of the one the update builds on.
     room.attach(open(2).prepare(Some(&history)).unwrap());
-    assert!(matches!(room.admit(&update), Err(HistoryError::Unreadable(_))));
+    assert_eq!(room.admit(&update), Err(HistoryError::Lacking));
 }
 
 /// A room's history and three updates to it that fuzzing made, each with a sound checksum. Loro panics as
