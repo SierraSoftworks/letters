@@ -4,7 +4,8 @@
 //!   dictionary is left unchecked.
 //! - [`Checker`] checks words and text in one language and suggests corrections.
 //! - [`Proofing`] keeps the misspellings of a whole document, a block at a time.
-//! - [`best_dictionary`] says which of the dictionaries a system or a server holds serves a language.
+//! - [`best_dictionary`] says which of the dictionaries a system or a server holds serves a language, and
+//!   [`served_dictionaries`] which of a server's a shell asks for.
 //!
 //! A word is accepted when the language's dictionary, the document's dictionary or the user's words know it.
 //! Nothing here starts a thread or takes long: the shell decides when each step runs.
@@ -18,6 +19,6 @@ mod text;
 
 pub use bundled::{FILES as ENGLISH_FILES, provide as provide_english};
 pub use dictionary::{Dictionary, DictionaryError};
-pub use named::{best_dictionary, dictionary_language};
+pub use named::{best_dictionary, dictionary_language, served_dictionaries};
 pub use proofing::{Checked, Proofing, language_at};
 pub use speller::{Checker, Speller};

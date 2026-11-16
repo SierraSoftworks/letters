@@ -3,6 +3,8 @@
 //! A Hunspell dictionary is an `.aff` and a `.dic` file of one name, such as `de_DE` or `pt_BR`. Every shell
 //! and the server choose by the one rule here, so that a language is checked alike wherever it is written.
 
+use std::collections::BTreeMap;
+
 use crate::speller::Tag;
 
 /// A name as it chooses: its tag, and whether it says more than a language and a region, as `de_DE_frami`
@@ -40,4 +42,25 @@ pub fn best_dictionary<'a>(names: impl IntoIterator<Item = &'a str>, language: &
     let serves = names.into_iter().enumerate().filter_map(|(place, name)| Some((place, read(name)?)));
     let serves = serves.filter(|(_, (tag, _))| tag.language == wanted.language);
     serves.min_by_key(|(place, (tag, more))| (rank(tag), *more, *place)).map(|(place, _)| place)
+}
+
+/// The dictionaries among `held`, a server's by their tags, that text in `languages` is checked against:
+/// each by the server's tag for it, to ask the server by, with the tag a speller takes it under.
+///
+/// The one a region the server has none for falls back to goes under the language alone, where a speller
+/// looks for such a region's, so that the speller and the server choose alike in whatever order the
+/// dictionaries arrive. Two of the languages that one dictionary serves ask for it once.
+pub fn served_dictionaries<'a>(
+    languages: impl IntoIterator<Item = &'a str>,
+    held: &[String],
+) -> BTreeMap<String, String> {
+    let best = |tag: &str| best_dictionary(held.iter().map(String::as_str), tag);
+    let mut wanted = BTreeMap::new();
+    for tag in languages {
+        let Some(at) = best(tag) else { continue };
+        let language = tag.split('-').next().unwrap_or(tag);
+        let under = if best(language) == Some(at) { language.to_owned() } else { held[at].clone() };
+        wanted.insert(held[at].clone(), under);
+    }
+    wanted
 }

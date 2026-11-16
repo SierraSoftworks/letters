@@ -5,7 +5,7 @@
 //! language the system has no dictionary for is asked of the server a document is kept at, if it is kept
 //! at one, and else simply left unchecked.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
@@ -119,22 +119,6 @@ pub fn load(folders: &[PathBuf], language: &str) -> Option<(String, Dictionary)>
             None
         }
     }
-}
-
-/// The dictionaries among `held`, a server's by their tags, that text in `languages` is checked against:
-/// each by the server's tag for it, with the tag a speller takes it under. The one a region the server has
-/// none for falls back to goes under the language alone, where a speller looks for such a region's, so
-/// that the speller and the server choose alike. The browser asks by the same rule.
-pub fn served(languages: &BTreeSet<String>, held: &[String]) -> BTreeMap<String, String> {
-    let best = |tag: &str| best_dictionary(held.iter().map(String::as_str), tag);
-    let mut wanted = BTreeMap::new();
-    for tag in languages {
-        let Some(at) = best(tag) else { continue };
-        let language = tag.split('-').next().unwrap_or(tag);
-        let under = if best(language) == Some(at) { language.to_owned() } else { held[at].clone() };
-        wanted.insert(held[at].clone(), under);
-    }
-    wanted
 }
 
 /// Reads the dictionary a server has for the language `tag`, one of those it lists. `None` when it

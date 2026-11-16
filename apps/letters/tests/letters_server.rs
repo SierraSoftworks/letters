@@ -837,8 +837,7 @@ fn a_language_the_system_has_no_dictionary_for_is_checked_against_the_servers() 
     assert_eq!(held, ["de-DE"]);
 
     // Swiss German is checked against it, as the server has none nearer.
-    let named = ["de-CH".to_owned()].into();
-    let wanted = dictionaries::served(&named, &held);
+    let wanted = letters_spell::served_dictionaries(["de-CH"], &held);
     assert_eq!(wanted.get("de-DE").map(String::as_str), Some("de"));
     let dictionary = dictionaries::fetch(&session, "de-DE").expect("the dictionary is read");
     assert!(dictionary.check("Stra\u{df}e") && !dictionary.check("zzyzx"));

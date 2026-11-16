@@ -1315,7 +1315,7 @@ impl DocWindow {
                 // A server that is out of reach is asked again when the document is next saved.
                 (None, Err(_)) => return drop(proxy.send_event(Event::Unasked(id, lacking.into_iter().collect()))),
             };
-            for (tag, under) in dictionaries::served(&lacking, &held) {
+            for (tag, under) in letters_spell::served_dictionaries(lacking.iter().map(String::as_str), &held) {
                 if let Some(dictionary) = dictionaries::fetch(&session, &tag) {
                     let _ = proxy.send_event(Event::Dictionary(id, under, Box::new(dictionary)));
                 }
