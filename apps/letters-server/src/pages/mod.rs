@@ -9,6 +9,7 @@
 //! - [`editor`] is a document in the browser's editor, and the files of that editor.
 //! - [`door`] is where a share link leads.
 
+mod activity;
 mod acts;
 mod door;
 pub mod editor;
@@ -276,6 +277,9 @@ struct Asked {
     /// The code of what a form on the page was refused with.
     #[serde(default)]
     error: Option<String>,
+    /// With `share`: the dialog opens on the access log's rows from before this time.
+    #[serde(default)]
+    before: Option<u64>,
 }
 
 /// The address that opens the folder at `here` with a question about the document `id`.
@@ -364,7 +368,13 @@ async fn folder(
                             ends: link.expires.map(|ends| day(ends, now)),
                         };
                         let links = shares.links.iter().filter(live).map(linked).collect();
-                        Ask::Share(entry, shares.people, app.directory(&who).unwrap_or_default(), links)
+                        // Whoever may share reads the log. One that cannot be read now lists nothing.
+                        let id = entry.id.as_deref().unwrap_or_default();
+                        let rows = app.access(&who, id, asked.before, None).unwrap_or_default();
+                        let here = paths::folder_page(&listing.space.id, &listing.path);
+                        let before = |time: u64| format!("{}&before={time}", asking(&here, "share", id));
+                        let log = activity::listed(&rows, now, asked.before.is_some(), before);
+                        Ask::Share(entry, shares.people, app.directory(&who).unwrap_or_default(), links, log)
                     })
                 }
                 (Some("rename"), Some(entry)) if edits => Some(Ask::Rename(entry)),

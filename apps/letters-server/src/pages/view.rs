@@ -79,8 +79,38 @@ pub enum Ask {
     /// Where to, among the folders the person may put it in.
     Move(api::Entry, Vec<Target>),
     Trash(api::Entry),
-    /// Who it is shared with, who it can be shared with besides, and the links that open it.
-    Share(api::Entry, Vec<api::Grant>, Vec<api::Grantee>, Vec<Linked>),
+    /// Who it is shared with, who it can be shared with besides, the links that open it, and what was
+    /// done through all of them.
+    Share(api::Entry, Vec<api::Grant>, Vec<api::Grantee>, Vec<Linked>, Activity),
+}
+
+/// A document's access log, as the Share dialog's Activity tab lists it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Activity {
+    /// Its rows by day, newest first, each day under what it is called.
+    pub days: Vec<(String, Vec<Reached>)>,
+    /// How many days the server keeps a row.
+    pub kept: u32,
+    /// The address that lists the rows from before these, where there may be some.
+    pub earlier: Option<String>,
+    /// These are not the newest: the dialog opens on them, and offers the way back.
+    pub older: bool,
+}
+
+/// One row of the access log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reached {
+    /// Who did what, as a sentence without its full stop.
+    pub said: String,
+    pub action: api::Action,
+    pub role: api::Role,
+    pub refused: bool,
+    /// The label of the link they came by.
+    pub link: Option<String>,
+    /// The address and the browser it came from.
+    pub from: String,
+    /// The time of day.
+    pub at: String,
 }
 
 /// A link that still opens a document, as the Share dialog lists it.
@@ -454,7 +484,7 @@ fn asked(ask: &Ask, here: &str) -> Html {
         Ask::Rename(entry) => (entry, format!("Rename {}", entry.name), "Rename", ACT_RENAME),
         Ask::Move(entry, _) => (entry, format!("Move {}", entry.name), "Move", ACT_MOVE),
         Ask::Trash(entry) => (entry, format!("Move {} to the trash?", entry.name), "Move to trash", ACT_TRASH),
-        Ask::Share(entry, people, offered, links) => return sharing(entry, people, offered, links, here),
+        Ask::Share(entry, people, offered, links, log) => return sharing(entry, people, offered, links, log, here),
     };
     let fields = match ask {
         Ask::Rename(entry) => html! {
@@ -555,10 +585,88 @@ fn grantee(to: &api::Grantee) -> (String, String) {
     }
 }
 
-/// The Share dialog, open over the folder at `here`: who the document is shared with, each with the way to
-/// take them out, a form that shares it with one more or gives one of them another role, and the links
-/// that open it, each with the way to revoke it. A link is made in the editor, which shows its address.
-fn sharing(entry: &api::Entry, people: &[api::Grant], offered: &[api::Grantee], links: &[Linked], here: &str) -> Html {
+/// The Activity tab of the Share dialog: the document's access log by day, newest first. A row has the
+/// icon of what was done in the colour of the role it was done with, and amber marks what was refused.
+/// `newest` is the address that opens the dialog on the newest rows.
+fn activity(log: &Activity, newest: &str) -> Html {
+    let row = |reached: &Reached| {
+        let icon = match reached.action {
+            api::Action::Open | api::Action::Other => icons::EYE,
+            api::Action::Edit => icons::PENCIL,
+            api::Action::Comment => icons::MESSAGE_SQUARE,
+            api::Action::Download => icons::DOWNLOAD,
+            api::Action::Print => icons::PRINTER,
+        };
+        let tone = match reached.role {
+            _ if reached.refused => Some(Tone::Warn),
+            api::Role::Reader => None,
+            api::Role::Commenter => Some(Tone::Info),
+            api::Role::Editor | api::Role::Owner => Some(Tone::Ok),
+        };
+        let meta = html! {
+            <>
+                <span>{ role(reached.role) }</span>
+                if let Some(label) = &reached.link {
+                    <span class="lt-activity__link"><Icon icon={icons::LINK} />{ label.clone() }</span>
+                }
+                <span class="lt-activity__from" title={reached.from.clone()}>{ reached.from.clone() }</span>
+            </>
+        };
+        html! {
+            <TimelineItem title={html! { <>{ reached.said.clone() }</> }} {tone} {icon} {meta} aside={html! { <>{ reached.at.clone() }</> }} />
+        }
+    };
+    let day = |(called, rows): &(String, Vec<Reached>)| {
+        html! {
+            <section>
+                <h3 class="lt-shares__title">{ called.clone() }</h3>
+                <Timeline label={called.clone()} size={Size::Small} run_off={TimelineRunOff::None}>
+                    { for rows.iter().map(row) }
+                </Timeline>
+            </section>
+        }
+    };
+    let within = match log.kept {
+        0 => String::new(),
+        1 => " in the last day".to_owned(),
+        days => format!(" in the last {days} days"),
+    };
+    html! {
+        <Stack gap={Space::Lg}>
+            if log.days.is_empty() && log.older {
+                <p class="lt-note">{ "Nothing from before that is kept." }</p>
+            } else if log.days.is_empty() {
+                <p class="lt-note">{ "Nobody has reached this document through a share yet." }</p>
+            } else {
+                <p class="lt-note">{ format!("Everything that reached this document through a share{within}, newest first.") }</p>
+                { for log.days.iter().map(day) }
+            }
+            if log.older || log.earlier.is_some() {
+                <div class="lt-activity__more">
+                    if log.older {
+                        <Button size={Size::Small} href={newest.to_owned()}>{ "Show the newest" }</Button>
+                    }
+                    if let Some(earlier) = &log.earlier {
+                        <Button size={Size::Small} href={earlier.clone()}>{ "Show earlier" }</Button>
+                    }
+                </div>
+            }
+        </Stack>
+    }
+}
+
+/// The Share dialog, open over the folder at `here`. Its first tab is who the document is shared with, each
+/// with the way to take them out, a form that shares it with one more or gives one of them another role,
+/// and the links that open it, each with the way to revoke it. A link is made in the editor, which shows
+/// its address. Its second tab is what was done through all of them.
+fn sharing(
+    entry: &api::Entry,
+    people: &[api::Grant],
+    offered: &[api::Grantee],
+    links: &[Linked],
+    log: &Activity,
+    here: &str,
+) -> Html {
     let id = entry.id.as_deref().unwrap_or_default();
     let link = |link: &Linked| {
         let asks = link.passphrase.then(|| "with a passphrase".to_owned());
@@ -613,9 +721,11 @@ fn sharing(entry: &api::Entry, people: &[api::Grant], offered: &[api::Grantee], 
         <Dialog id="asked" open=true title={format!("Share {}", entry.name)} footer={html! {
             <Button href={here.to_owned()}>{ "Done" }</Button>
         }}>
+            <Tabs label="Sharing" default_selected={if log.older { "activity" } else { "people" }}>
+            <Tab value="people" label="People">
             <Stack gap={Space::Lg}>
                 if people.is_empty() {
-                    <p class="lt-dim">{ "Shared with nobody yet. Whoever is in its space reaches it as before." }</p>
+                    <p class="lt-note">{ "Shared with nobody yet. Whoever is in its space reaches it as before." }</p>
                 } else {
                     <ul class="lt-shares" aria-label="Shared with">{ for people.iter().map(row) }</ul>
                 }
@@ -637,6 +747,11 @@ fn sharing(entry: &api::Entry, people: &[api::Grant], offered: &[api::Grantee], 
                     </section>
                 }
             </Stack>
+            </Tab>
+            <Tab value="activity" label="Activity">
+                { activity(log, &asking(here, "share", id)) }
+            </Tab>
+            </Tabs>
         </Dialog>
     }
 }

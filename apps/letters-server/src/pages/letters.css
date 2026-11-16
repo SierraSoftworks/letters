@@ -11,6 +11,8 @@ a.lt-file__name:hover { text-decoration: underline; }
 .lt-file__more { inline-size: 1%; text-align: end; white-space: nowrap; }
 .lt-file__more form { display: none; }
 .lt-dim { color: var(--yi-fg-muted); font-size: var(--yi-text-sm); white-space: nowrap; }
+/* A sentence said in a dialog, which wraps where a table's cell does not. */
+.lt-note { margin: 0; color: var(--yi-fg-muted); font-size: var(--yi-text-sm); }
 
 /* The Share dialog: who a document is shared with, each face, name, role and way out in a column of its
    own, the form that shares it with one more, and its links in the same columns. */
@@ -28,6 +30,12 @@ a.lt-file__name:hover { text-decoration: underline; }
 .lt-shares__add { display: flex; flex-wrap: wrap; align-items: end; gap: var(--yi-space-sm); }
 .lt-shares__to { flex: 1; min-inline-size: 12rem; }
 .lt-shares__title { margin: 0 0 var(--yi-space-xs); font-size: var(--yi-text-sm); font-weight: 600; color: var(--yi-fg-muted); }
+
+/* The Activity tab: the link a row came by, where from on one line however long a browser names itself,
+   and the ways to other rows. */
+.lt-activity__link { display: inline-flex; align-items: center; gap: var(--yi-space-2xs); font-weight: 600; }
+.lt-activity__from { flex: 1 1 8rem; min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lt-activity__more { display: flex; gap: var(--yi-space-sm); }
 
 /* A page with no frame: one thing said in the middle of it. */
 .lt-card {

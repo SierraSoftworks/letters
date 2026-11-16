@@ -42,7 +42,7 @@ const SWEEP: u64 = 24 * 3600;
 /// How many things noted of late are remembered, to tell one done again.
 const COUNTED: usize = 10_000;
 /// How many rows are sent when no number is asked for, and the most that ever are.
-const LISTED: usize = 200;
+pub(crate) const LISTED: usize = 200;
 const MOST: usize = 1000;
 
 fn under(id: &str, root: &str) -> String {

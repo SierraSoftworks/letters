@@ -3,7 +3,7 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{Browser, START, Server, URL, follow, link, names};
+use common::{Browser, START, Server, URL, follow, let_in, link, names, planned};
 use letters_api::{CreatedLink, Entry, Listing, NewLink, Opened, Role, paths};
 use letters_server::pages::{
     ACT_IMPORT, ACT_MERGE, ACT_MOVE, ACT_NEW_DOCUMENT, ACT_NEW_FOLDER, ACT_PUT_BACK, ACT_RENAME, ACT_REVOKE, ACT_SHARE,
@@ -227,6 +227,53 @@ async fn the_share_dialog_lists_the_links_that_open_a_document_and_revokes_them(
     assert_eq!(ada.fill(ACT_REVOKE, &about).await.location(), ask);
     assert!(!page(&mut ada, &ask).await.contains("Accountant"), "a revoked link is not listed");
     assert_eq!(follow(&mut server.visitor(), &made[0]).await.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_share_dialog_tells_what_was_done_through_a_share_or_a_link() {
+    let (server, ada, ben, id) = planned("activity-form").await;
+    let mut owner = server.reader("ada", &[]);
+    let ask = asking(&paths::folder_page("home", ""), "share", &id);
+    let dialog = page(&mut owner, &ask).await;
+    assert!(dialog.contains("Activity") && dialog.contains("Nobody has reached"), "a log with nothing in it says so");
+
+    // Ben opens the document by his share. A link's reader opens it, and is refused its file.
+    let _: Opened = ben.get(&paths::document(&id)).await.unwrap();
+    server.wait(10);
+    let (mut guest, _) = let_in(&server, &ada, &id, &link("Accountant", Role::Reader)).await;
+    assert_eq!(guest.get(&paths::document(&id)).await.status, StatusCode::OK);
+    server.wait(10);
+    assert_eq!(guest.get(&paths::file(&id)).await.status, StatusCode::FORBIDDEN);
+
+    // Each is told by who did what, the newest first, and a guest by the link they came by.
+    let dialog = page(&mut owner, &ask).await;
+    let told = ["Guest was refused a download", "Guest opened the document", "Ben opened the document"];
+    let at: Vec<usize> =
+        told.iter().map(|said| dialog.find(said).unwrap_or_else(|| panic!("{said}: {dialog}"))).collect();
+    assert!(at.is_sorted(), "the newest comes first: {at:?}");
+    assert!(dialog[at[0]..at[2]].contains("Accountant"), "a guest's row names their link");
+    assert!(dialog.contains("Today"), "the rows are under their day");
+    assert!(!dialog.contains("before="), "a log this short is shown whole");
+}
+
+#[tokio::test]
+async fn the_share_dialog_shows_a_long_log_a_page_at_a_time() {
+    let (server, _, _, id) = planned("activity-pages").await;
+    // Ben opens the document once more than a page holds, each long enough after the last to be a row of
+    // its own. A session does not last that long, so each is a sign-in of its own.
+    for _ in 0..=200 {
+        let _: Opened = server.person("ben", &[]).get(&paths::document(&id)).await.unwrap();
+        server.wait(600);
+    }
+    let mut owner = server.reader("ada", &[]);
+    let rows = |dialog: &str| dialog.matches("Ben opened the document").count();
+    let ask = asking(&paths::folder_page("home", ""), "share", &id);
+    let newest = page(&mut owner, &ask).await;
+    let earlier = newest.split('"').find(|part| part.contains("before=")).expect("a full page offers what came before");
+    let earlier = page(&mut owner, &earlier.replace("&amp;", "&")).await;
+    assert_eq!(rows(&newest) + rows(&earlier), 201, "every row is on one page or the other");
+    assert!(rows(&earlier) >= 1 && !earlier.contains("before="), "the last page offers nothing earlier");
+    assert!(earlier.contains(&format!("href=\"{}\"", ask.replace('&', "&amp;"))), "and the way back to the newest");
 }
 
 #[tokio::test]
