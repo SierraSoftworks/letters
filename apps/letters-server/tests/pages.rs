@@ -247,7 +247,7 @@ async fn the_share_dialog_tells_what_was_done_through_a_share_or_a_link() {
 
     // Each is told by who did what, the newest first, and a guest by the link they came by.
     let dialog = page(&mut owner, &ask).await;
-    let told = ["Guest was refused a download", "Guest opened the document", "Ben opened the document"];
+    let told = ["Guest was refused a download", "Guest viewed the document", "Ben viewed the document"];
     let at: Vec<usize> =
         told.iter().map(|said| dialog.find(said).unwrap_or_else(|| panic!("{said}: {dialog}"))).collect();
     assert!(at.is_sorted(), "the newest comes first: {at:?}");
@@ -267,7 +267,7 @@ async fn the_share_dialog_shows_a_long_log_a_page_at_a_time() {
         server.wait(600);
     }
     let mut owner = server.reader("ada", &[]);
-    let rows = |dialog: &str| dialog.matches("Ben opened the document").count();
+    let rows = |dialog: &str| dialog.matches("Ben viewed the document").count();
     let ask = asking(&paths::folder_page("home", ""), "share", &id);
     let newest = page(&mut owner, &ask).await;
     let earlier = newest.split('"').find(|part| part.contains("before=")).expect("a full page offers what came before");

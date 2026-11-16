@@ -12,7 +12,7 @@ use crate::access::{KEPT_DAYS, LISTED};
 /// What was done, after the name of who did it.
 fn did(action: Action, refused: bool) -> &'static str {
     match (action, refused) {
-        (Action::Open, false) => "opened the document",
+        (Action::Open, false) => "viewed the document",
         (Action::Edit, false) => "started editing",
         (Action::Comment, false) => "wrote a comment",
         (Action::Download, false) => "downloaded a copy",
