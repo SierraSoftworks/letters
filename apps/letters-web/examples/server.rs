@@ -111,6 +111,7 @@ impl Desk {
                     Some(model) => model.merge(&updates).map(drop).map_err(|error| error.to_string()),
                     None => Model::load(&updates, ReplicaId::new(&format!("desk{}", std::process::id())))
                         .map(|model| self.model = Some(model))
+                        .map(|()| self.model.iter_mut().for_each(|model| model.set_author(BEN.1)))
                         .map_err(|error| error.to_string()),
                 };
                 if let Err(error) = merged {

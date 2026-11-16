@@ -176,8 +176,9 @@ export const serve = async (page, said, answer = () => undefined, document = und
     const request = route.request();
     const path = new URL(request.url()).pathname;
     // A page looks up what the person set for themselves, the sources they trust and what the document is
-    // called by itself, which is not what a test asked of it.
-    if (request.method() !== "GET" || !["/api/v1/settings", "/api/v1/settings/sources", `/api/v1/documents/${said.id}`].includes(path)) {
+    // called by itself, and says where its person read up to: none of it is what a test asked of it.
+    const own = request.method() === "GET" ? ["/api/v1/settings", "/api/v1/settings/sources", `/api/v1/documents/${said.id}`] : [`/api/v1/documents/${said.id}/seen`];
+    if (!own.includes(path)) {
       asked.push({ method: request.method(), path, body: request.postDataBuffer(), type: await request.headerValue("content-type") });
     }
     const nothing = { status: 404, body: { code: "not_found", message: "Nothing is there." } };

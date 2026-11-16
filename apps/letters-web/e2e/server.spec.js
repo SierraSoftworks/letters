@@ -189,3 +189,26 @@ test("a word and a source of pictures a person adds in one browser are theirs in
     server.stop();
   }
 });
+
+test("who wrote since a person's last visit is told from what their account keeps, in whatever browser", async ({ browser }) => {
+  const server = await served();
+  try {
+    const ada = await server.browser(browser, "ada");
+    const made = await ada.request.post("/api/v1/spaces/family/documents", { data: { name: "Minutes" }, headers: { origin: server.url } });
+    const { id } = await made.json();
+    // A page that goes says where its person read up to, though nothing was written on it.
+    const first = await open(ada, id);
+    await first.goto("about:blank");
+    await expect.poll(async () => (await ada.request.get(`/d/${id}`)).text()).toContain('"last_seen"');
+
+    server.device(`join ${id}`);
+    await server.texts();
+    server.device("write From the desk. ");
+    await expect.poll(async () => (await server.texts()).join("\n")).toContain("From the desk.");
+
+    const next = await open(await server.browser(browser, "ada"), id);
+    await expect(next.getByText("Edited by Ben", { exact: true })).toBeAttached();
+  } finally {
+    server.stop();
+  }
+});

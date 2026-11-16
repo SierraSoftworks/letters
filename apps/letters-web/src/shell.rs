@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use accesskit::{Action, ActionData, ActionRequest, NodeId, TextPosition, TextSelection, TreeId};
 use js_sys::{Array, Function, Map, Object, Promise, Reflect, Uint8Array};
-use letters_api::{Code, Fetch, Opened, Preview, Shares, paths};
+use letters_api::{Code, Fetch, Opened, Preview, Seen, Shares, paths};
 use letters_editor::{Clip, Editor, Key, KeyEvent, Modifiers, Picture, Platform as _};
 use letters_model::{
     BlockId, BlockKind, Change, Document, HistoryError, Mark, Model, Notes, Pos, ReplicaId, Revision, Selection, Style,
@@ -221,6 +221,8 @@ pub struct Shell {
     /// tells who else wrote by it. And whether the window was told what they last saw of the document.
     named: bool,
     seen: bool,
+    /// The revision the person's account was last told they read the document up to, and when.
+    seen_told: (Option<String>, Option<u64>),
     /// How many pictures are on their way to the server. The edits that name them wait for them.
     uploading: u32,
     /// What the server lets this person do with the document. It says so with the page, and again with
@@ -413,6 +415,7 @@ impl Shell {
                 attached: false,
                 named: false,
                 seen: false,
+                seen_told: (None, None),
                 uploading: 0,
                 role: Role::Editor,
                 access: Access::Edits,
@@ -554,7 +557,7 @@ impl Shell {
                 event.prevent_default();
             }
         })?;
-        hear(&shell, &window, "pagehide", |shell, _: Event| shell.keep_seen())?;
+        hear(&shell, &window, "pagehide", |shell, _: Event| shell.keep_seen(false))?;
         // Another tab of the editor may have added to the person's words, kept another default style, or
         // changed their settings.
         hear(&shell, &window, "storage", |shell, _: Event| {
@@ -1078,7 +1081,8 @@ impl Shell {
     }
 
     /// Whether a share link alone leads the person to the document. What they take of it is then the
-    /// document as it stands, and its past is not shown to them. A courtesy: the history is on the page.
+    /// document as it stands, and the window shows them none of its past (`page::served_on`). A courtesy:
+    /// the history is on the page.
     fn by_link(&self) -> bool {
         self.server.as_ref().is_some_and(|server| server.by_link)
     }
@@ -1389,7 +1393,7 @@ impl Shell {
         self.stats.live = self.attached && connection == Some(Connection::Live);
         if state != self.save_state || connection != self.connection {
             if state == SaveState::Saved && self.save_state != state {
-                self.keep_seen();
+                self.keep_seen(true);
             }
             self.save_state = state;
             self.view.set_save_state(state);
@@ -2320,24 +2324,34 @@ impl Shell {
         Ok(())
     }
 
-    /// Tells the window what the person last saw of the document, once: when the server's history is the
-    /// document's and the person has their name, by which the window knows what others wrote since.
+    /// Tells the window what the person last saw of the document, as their account keeps it, once: when
+    /// the server's history is the document's and the person has their name, by which the window knows
+    /// what others wrote since.
     fn say_seen(&mut self) {
         let ready = self.attached && self.named && !self.seen;
-        // The note leads to the history, which is not shown to one a link alone leads in.
-        let Some(server) = self.server.as_ref().filter(|server| ready && !server.by_link) else { return };
+        let Some(server) = self.server.as_ref().filter(|_| ready) else { return };
         self.seen = true;
-        let seen = self.platform.last_seen(&server.id).and_then(|seen| seen.parse().ok());
+        self.seen_told.0.clone_from(&server.last_seen);
+        let seen = server.last_seen.as_ref().and_then(|seen| seen.parse().ok());
         self.view.set_last_seen(seen);
     }
 
-    /// Keeps how the document reads now as what the person last saw of it: when the page goes, and when
-    /// what they wrote is the server's, so that a page that dies has lost little. Not before the window
-    /// was told what was kept the last time.
-    fn keep_seen(&self) {
-        if let Some(server) = self.server.as_ref().filter(|_| self.attached && self.seen) {
-            self.platform.keep_last_seen(&server.id, &self.view.editor().model().revision().to_string());
+    /// Has the person's account keep how the document reads now as what they last saw of it: when the
+    /// page goes, and `saved` when what they wrote is the server's, so that a page that dies has lost
+    /// little. A save soon after another is left to the next. Not before the window was told what the
+    /// account kept the last time.
+    fn keep_seen(&mut self, saved: bool) {
+        let Some(server) = self.server.as_ref().filter(|_| self.attached && self.seen) else { return };
+        let (revision, now) = (self.view.editor().model().revision().to_string(), self.platform.now_ms());
+        let (told, at) = &self.seen_told;
+        let soon = at.is_some_and(|at| now.saturating_sub(at) < SEEN_APART_MS);
+        // A document nothing was ever written in reads at no revision, which is nothing to keep.
+        if revision.is_empty() || told.as_ref() == Some(&revision) || (saved && soon) {
+            return;
         }
+        let seen = serde_json::to_vec(&Seen { revision: revision.clone() }).expect("a revision is JSON");
+        browser::tell(&self.window, "PUT", &paths::seen(&server.id), (letters_api::JSON, &seen));
+        self.seen_told = (Some(revision), Some(now));
     }
 
     /// Tells the window what the person may do with the document: what their role allows, and nothing
@@ -3018,6 +3032,9 @@ enum Linking {
     /// The person wants it kept in this figure.
     Embed(BlockId),
 }
+
+/// The least time between two tellings of what the person last saw, while they write.
+const SEEN_APART_MS: u64 = 30_000;
 
 /// How long a picture waits for a server that has fetched all it does for now and does not say how long:
 /// its count starts again with each minute.

@@ -65,16 +65,25 @@ test("two people with the document open read what the other writes, and see who 
 test("who else wrote since the person's last visit is told when they come back, and what they wrote themselves is not", async ({ page, browser }) => {
   const host = hosted();
   const note = page.getByText(/^Edited by/);
-  await serve(page, opened(), undefined, undefined, host);
+  // The account keeps where the person read up to, and the page is told with the document.
+  let seen;
+  const account = (method, path, body) => {
+    if (method !== "PUT" || !path.endsWith("/seen")) return undefined;
+    seen = JSON.parse(body).revision;
+    return { status: 204 };
+  };
+  const visit = (last_seen) => serve(page, opened({ last_seen }), account, undefined, host);
+  await visit();
   await page.keyboard.type("From Ada.");
   await expect.poll(() => held(host)).toContain("From Ada.");
+  await expect.poll(() => seen).toBeTruthy();
   await page.goto("about:blank");
-  await serve(page, opened(), undefined, undefined, host);
+  await visit(seen);
   await rested(page);
   await expect(note).not.toBeAttached();
   await page.goto("about:blank");
 
-  // Someone else writes meanwhile, in a browser of their own.
+  // Someone else writes meanwhile.
   const theirs = await browser.newContext();
   const other = await theirs.newPage();
   await serve(other, opened({ author: "Grace Hopper" }), undefined, undefined, host);
@@ -82,7 +91,7 @@ test("who else wrote since the person's last visit is told when they come back, 
   await expect.poll(() => held(host)).toContain("From Grace.");
   await theirs.close();
 
-  await serve(page, opened(), undefined, undefined, host);
+  await visit(seen);
   await expect(note).toHaveText("Edited by Grace Hopper");
 });
 

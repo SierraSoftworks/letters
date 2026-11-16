@@ -49,14 +49,17 @@ pub fn ask(
     async move { answered.await.map_err(|(refusal, _)| refusal) }
 }
 
-/// As [`ask`], with how many seconds the server said to wait before the same is asked again, where a
-/// refusal says: its `Retry-After`.
-pub fn ask_and_wait(
-    window: &Window,
-    method: &str,
-    path: &str,
-    body: Option<(&str, &[u8])>,
-) -> impl Future<Output = Result<Vec<u8>, (letters_api::Error, Option<u32>)>> + 'static + use<> {
+/// Tells the server something the page does not wait to hear of, and that reaches it though the page
+/// goes: the browser keeps the request alive past the page.
+pub fn tell(window: &Window, method: &str, path: &str, body: (&str, &[u8])) {
+    let request = request(method, Some(body));
+    // A plain object always takes a key.
+    let _ = Reflect::set(&request, &"keepalive".into(), &true.into());
+    let _ = window.fetch_with_str_and_init(path, &request);
+}
+
+/// A request of this method, with a body of this kind if one is given.
+fn request(method: &str, body: Option<(&str, &[u8])>) -> RequestInit {
     let request = RequestInit::new();
     request.set_method(method);
     if let Some((kind, bytes)) = body {
@@ -66,7 +69,18 @@ pub fn ask_and_wait(
         request.set_headers(&headers);
         request.set_body(&Uint8Array::from(bytes));
     }
-    let sent = window.fetch_with_str_and_init(path, &request);
+    request
+}
+
+/// As [`ask`], with how many seconds the server said to wait before the same is asked again, where a
+/// refusal says: its `Retry-After`.
+pub fn ask_and_wait(
+    window: &Window,
+    method: &str,
+    path: &str,
+    body: Option<(&str, &[u8])>,
+) -> impl Future<Output = Result<Vec<u8>, (letters_api::Error, Option<u32>)>> + 'static + use<> {
+    let sent = window.fetch_with_str_and_init(path, &request(method, body));
     async move {
         let lost =
             |_| (letters_api::Error::new(letters_api::Code::Unavailable, "The server could not be reached."), None);
@@ -155,10 +169,6 @@ const WORDS: &str = "letters.words";
 /// Where this browser keeps those of the person's words their account is yet to be told, a line each. A
 /// browser that has none has asked no account, and no word of it was told.
 const UNSENT: &str = "letters.words.unsent";
-
-/// Where this browser keeps what the person last saw of a server's document, under the document's id after
-/// this: the revision it read at, for the note of what others wrote since.
-const SEEN: &str = "letters.seen.";
 
 /// Where this browser keeps the person's default style, as a `style.json`, until an account keeps it.
 const STYLE: &str = "letters.style";
@@ -354,18 +364,6 @@ impl Browser {
     /// Whether an account was ever told this browser's words.
     fn told_an_account(&self) -> bool {
         self.storage.as_ref().is_some_and(|storage| matches!(storage.get_item(UNSENT), Ok(Some(_))))
-    }
-
-    /// The revision the document of this id read at when the person last had it open in this browser.
-    pub fn last_seen(&self, id: &str) -> Option<String> {
-        self.storage.as_ref()?.get_item(&format!("{SEEN}{id}")).ok().flatten()
-    }
-
-    /// Keeps `revision` as what the person last saw of the document of this id.
-    pub fn keep_last_seen(&self, id: &str, revision: &str) {
-        if let Some(storage) = &self.storage {
-            let _ = storage.set_item(&format!("{SEEN}{id}"), revision);
-        }
     }
 
     /// The `style.json` the person kept as their default in this browser, if they kept one.
