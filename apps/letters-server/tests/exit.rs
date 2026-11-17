@@ -684,6 +684,8 @@ fn a_journal_with_an_edit_that_does_not_stand_is_set_aside_and_its_document_open
     let refused = include_bytes!("../../../fuzz/corpus/history/a-first-edit-that-builds-on-one-before-it.bin");
     journal.edits(&mut state, refused).unwrap();
     let found = std::fs::read(rooms.join(room).join(&name)).unwrap();
+    // A run that ended between a room's last save and the end of its folder left one with nothing in it.
+    std::fs::create_dir(rooms.join("emptied")).unwrap();
 
     // Nobody opens the document. The server that starts next takes what stands to the file by itself.
     let served = Served::start(&scratch.0, "state");
@@ -702,7 +704,7 @@ fn a_journal_with_an_edit_that_does_not_stand_is_set_aside_and_its_document_open
     (ada.at, ben.at) = (served.at, served.at);
     until("both are back and agree", &mut [&mut ada, &mut ben], agree);
     assert!(ben.said().contains("Kept."));
-    // Once its file holds everything the room's folder goes, and what was set aside stays.
+    // Once its file holds everything a room's folder goes, and what was set aside stays.
     drop((ada, ben));
     served.stop();
     assert_eq!(scratch.names("state/rooms"), std::slice::from_ref(aside));

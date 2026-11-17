@@ -531,7 +531,10 @@ impl Rooms {
     /// Takes the journal folder `name`, which is at `path`, to its document's file.
     fn take(&self, app: &Shared, all: &[&Root], path: &Path, name: &str) {
         let Some(mut state) = self.journals(name) else { return };
-        let Some(left) = left_in(path, &mut state) else {
+        let left = left_in(path, &mut state);
+        // Let go of here, before it is removed or a room takes it: Windows removes no folder held open.
+        drop(state);
+        let Some(left) = left else {
             // Nothing is owed to any file.
             self.keep_aside(name);
             let _ = std::fs::remove_dir_all(path);
@@ -684,8 +687,12 @@ impl Open {
 
     /// Drops the room, and lets go of its journal.
     fn close(&self, rooms: &Rooms, state: &mut State) {
-        self.act(rooms, state, |hosted, _| hosted.discard(rooms));
+        let emptied = self.act(rooms, state, |hosted, _| hosted.discard(rooms)).flatten();
+        // The room goes before its folder does: Windows removes no folder that is held open.
         *state = State::Gone;
+        if let Some(folder) = emptied {
+            drop(std::fs::remove_dir_all(folder));
+        }
         self.gone();
     }
 }
@@ -920,15 +927,18 @@ impl Hosted {
         std::mem::forget(room);
     }
 
-    /// Lets go of the room's journal folder: removed once its file holds everything, and left for the
-    /// room that is opened next for the document otherwise.
-    fn discard(&mut self, rooms: &Rooms) {
+    /// Lets go of the room's journal folder: left for the room that is opened next for the document while
+    /// it holds what the file does not, and otherwise named, for whoever drops the room to remove.
+    fn discard(&mut self, rooms: &Rooms) -> Option<PathBuf> {
         let path = rooms.folder.join(&self.journal);
         match left_in(&path, &mut self.state) {
-            Some(left) => lock(&rooms.left).push((left.id, self.journal.clone())),
+            Some(left) => {
+                lock(&rooms.left).push((left.id, self.journal.clone()));
+                None
+            }
             None => {
                 rooms.keep_aside(&self.journal);
-                drop(std::fs::remove_dir_all(path));
+                Some(path)
             }
         }
     }
