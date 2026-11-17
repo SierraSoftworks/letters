@@ -165,10 +165,11 @@ jobs:
       - name: Install the musl compiler
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
 
+      # Shared with release.yml's `server` job.
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: server
+          shared-key: server
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build the browser's editor

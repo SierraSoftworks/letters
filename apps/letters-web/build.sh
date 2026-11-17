@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 # Builds the browser shell into `dist/`, ready to serve, and reports the size of its wasm.
+# `--no-report` leaves the report out, which compresses every file to measure it and takes minutes.
 set -eu
 cd "$(dirname "$0")"
 target=${CARGO_TARGET_DIR:-../../target}
@@ -8,6 +9,20 @@ wasm=$target/wasm32-unknown-unknown/web/letters_web.wasm
 # The command-line wasm-bindgen must be the version the crate was built against.
 version=$(sed -n '/^name = "wasm-bindgen"$/{n;s/version = "\(.*\)"/\1/p;}' ../../Cargo.lock)
 bindgen=$target/tools/bin/wasm-bindgen
+if [ "$("$bindgen" --version 2>/dev/null)" != "wasm-bindgen $version" ]; then
+  # Its project publishes it built for these systems, which saves a minute of compiling it.
+  case "$(uname -sm)" in
+    "Linux x86_64") built=x86_64-unknown-linux-musl ;;
+    "Linux aarch64") built=aarch64-unknown-linux-musl ;;
+    "Darwin x86_64") built=x86_64-apple-darwin ;;
+    "Darwin arm64") built=aarch64-apple-darwin ;;
+    *) built= ;;
+  esac
+  mkdir -p "$target/tools/bin"
+  [ -z "$built" ] ||
+    curl -fsSL --retry 2 "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$version/wasm-bindgen-$version-$built.tar.gz" |
+    tar -xz -C "$target/tools/bin" --strip-components 1 "wasm-bindgen-$version-$built/wasm-bindgen" || true
+fi
 if [ "$("$bindgen" --version 2>/dev/null)" != "wasm-bindgen $version" ]; then
   cargo install wasm-bindgen-cli --version "$version" --locked --root "$target/tools"
 fi
@@ -51,6 +66,8 @@ grep -v '^#' fallback.txt | while read -r wanted name url; do
   fi
   cp "$faces/$name" dist/fallback/
 done
+
+[ "${1:-}" != --no-report ] || exit 0
 
 # The same module with its function names left in, which the report reads to say whose the code is.
 "$bindgen" "$wasm" --target web --no-typescript --out-name letters --out-dir "$target/letters-web-named" --no-demangle
