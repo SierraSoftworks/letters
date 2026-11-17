@@ -1092,7 +1092,7 @@ fn notes(tags: &[Tag], copies: bool) -> Option<String> {
 fn writers(names: &[String]) -> Element<Message> {
     // The count takes the last face's place.
     let shown = if names.len() > FACES { FACES - 1 } else { names.len() };
-    let faces = names[..shown].iter().map(|name| face(name, false).tooltip(name.as_str(), Side::Top));
+    let faces = names[..shown].iter().map(|name| face(name).tooltip(name.as_str(), Side::Top));
     let rest = names[shown..].join(", ");
     let more = (names.len() > shown).then(|| lettered(&format!("+{}", names.len() - shown)).tooltip(rest, Side::Top));
     Element::row().width(WRITERS).gap(tokens::SPACE_2XS).children(faces).children(more)

@@ -11,6 +11,7 @@ mod activity;
 mod browsing;
 mod callouts;
 mod captions;
+mod cards;
 mod chrome;
 mod code_copy;
 pub mod color;

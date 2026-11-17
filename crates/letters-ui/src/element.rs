@@ -442,6 +442,14 @@ impl<M> Element<M> {
         self
     }
 
+    /// Places the children `by` further up and hides what leaves the element, for what keeps its place
+    /// beside something that scrolls by itself.
+    pub fn lifted(mut self, by: f32) -> Self {
+        self.style.lift = by;
+        self.style.clip = true;
+        self
+    }
+
     /// Scrolls the children vertically when they are taller than the element.
     pub fn scroll(mut self) -> Self {
         self.style.scroll = true;

@@ -109,8 +109,9 @@ fn show(window: &mut Harness, place: &str, what: &str) {
     match place {
         "a label" => window.ui().refuse_link("https://example.org/", what),
         "a note" => {
+            // The comment shows on its card beside the page.
             window.ui().set_notes(noted(NoteKind::Comment, Anchor::range("a", 0..5), &format!("{what} or F?")));
-            window.click(Role::Button, "1 comment");
+            window.paint();
         }
         "a conflict" => {
             let theirs = version("Alice Moreau", &format!("{what} rates rise in May."));

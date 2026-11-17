@@ -626,7 +626,8 @@ fn someone_who_comments_writes_comments_and_someone_who_reads_does_not() {
     for access in ALL {
         let mut window = granted(access);
         window.ui().set_notes(asked());
-        window.click(Role::Button, "1 comment").assert_open(Role::Dialog, "Comments");
+        // Its card beside the page is opened by a press.
+        window.click(Role::Group, "Comment");
         let can = access != Access::Reads;
         assert_eq!(has(&mut window, Role::TextInput, "Reply"), can, "{access:?}: a field for the reply");
         assert_eq!(says(&mut window, READS), !can, "{access:?}: or why there is none");

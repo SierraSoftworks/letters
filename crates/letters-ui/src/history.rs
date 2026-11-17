@@ -2053,7 +2053,7 @@ impl History {
         let mut body = Self::lines(head);
         let by = line.by(version);
         if !by.is_empty() {
-            let face = version.authors.first().map(|(name, _)| threads::face(name, false));
+            let face = version.authors.first().map(|(name, _)| threads::face(name));
             let said = Element::text(by.join(" \u{b7} "), small).fg(tokens::FG_MUTED).shrink();
             let said = Element::row().align(Align::Center).gap(tokens::SPACE_SM).shrink().children(face).child(said);
             body = body.child(said.height(threads::FACE));
@@ -2171,7 +2171,7 @@ impl History {
         let mut body = Self::lines(head);
         let by: Vec<&str> = [who.as_deref(), when.as_deref()].into_iter().flatten().collect();
         if !by.is_empty() {
-            let face = version.authors.first().map(|(name, _)| threads::face(name, false));
+            let face = version.authors.first().map(|(name, _)| threads::face(name));
             let by = Element::text(by.join(" \u{b7} "), small).fg(tokens::FG_MUTED).shrink();
             let by = Element::row().align(Align::Center).gap(tokens::SPACE_SM).shrink().children(face).child(by);
             // As tall with a face as without, so that the row's height is known before it is built.

@@ -1,5 +1,6 @@
 //! Notes on a passage: the tools over selected text, a comment written on it and its mark on the page, the
-//! markers in the margin, a note opened under its passage and the panel that lists them all.
+//! cards of the notes beside the page, and in a window with no room for those the markers in the margin
+//! and a note opened under its passage, and the panel that lists them all.
 
 use std::ops::Range;
 
@@ -23,8 +24,12 @@ fn letter() -> Harness {
     ];
     let mut window = Harness::open(Document { blocks, ..Document::default() });
     window.ui().set_author("Sam Okafor");
+    window.resize(NARROW, 800.0);
     window
 }
+
+/// A window with no room for cards beside the page: its notes open under their passages.
+const NARROW: f32 = 780.0;
 
 /// Where the written quote is in paragraph `a`.
 const QUOTE: Range<usize> = 6..19;
@@ -556,12 +561,14 @@ fn a_note_says_when_each_part_of_it_was_written() {
 fn each_kind_of_note_opens_with_what_can_be_done_about_it() {
     // The kind, and what its marker and the open note are called. A conflict opens in the page instead,
     // with both of its versions: see the tests of conflict review.
-    let cases = [(NoteKind::Comment, "1 comment", "Comments"), (NoteKind::Import, "1 import note", "Import note")];
-    for (kind, marker, title) in cases {
+    // What an import left is no one's to answer.
+    let cases =
+        [(NoteKind::Comment, "1 comment", "Comments", true), (NoteKind::Import, "1 import note", "Import note", false)];
+    for (kind, marker, title, answered) in cases {
         let mut window = noted(vec![note("n", kind, Anchor::block("b"), "Merged cells split")]);
         window.click(Role::Button, marker).assert_open(Role::Dialog, title);
         assert!(window.find(Role::Button, "Resolve").is_some(), "{title} can be resolved");
-        assert!(window.find(Role::TextInput, "Reply").is_some(), "{title} can be replied to");
+        assert_eq!(window.find(Role::TextInput, "Reply").is_some(), answered, "{title}: a reply");
     }
 }
 
@@ -706,6 +713,7 @@ fn the_page_and_the_margin_work_as_before_under_a_note_the_caret_opened() {
     // A link on the page is still followed with Ctrl or Cmd held, and the note stays by its passage.
     let href = "https://harland.example/quotes/north-slope";
     let mut window = Harness::doc(&format!("See [their email]({href}) for the written quote."));
+    window.resize(NARROW, 800.0);
     let line = window.editor().doc().blocks[0].id.clone();
     let text = window.editor().doc().blocks[0].plain_text();
     let (link, quote) = (text.find("email").expect("a link"), text.find("written").expect("a passage"));
@@ -733,6 +741,7 @@ fn the_sheet_of_a_formula_shows_in_place_of_a_note_the_caret_opened() {
     // A comment on words that end in a formula: `rafter has length c = a + b`.
     let blocks = vec![Block::text("p", BlockKind::Paragraph, "A rafter has length ")];
     let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.resize(NARROW, 800.0);
     window.ui().set_reduced_motion(true);
     window.ui().select(Selection::caret(Pos::new("p", 20)));
     window.type_text("$c = a + b$");
@@ -869,6 +878,8 @@ fn a_link_in_a_note_is_the_shells_to_open() {
 fn the_notes_panel_lists_open_notes_and_opens_one_at_its_passage() {
     // A long letter, with a comment on its last line and a note of an import on its first.
     let mut window = Harness::doc(&format!("{}Their written quote covers the slates.", "A line.\n\n".repeat(80)));
+    // Beside the panel the page has no room for cards.
+    window.resize(1100.0, 800.0);
     window.platform.wall = Some(NOW);
     let (first, last) = {
         let mut blocks = window.editor().doc().walk().map(|block| block.id.clone());
@@ -1028,6 +1039,7 @@ fn the_first_step_counts_from_the_block_the_caret_is_in_however_deep_it_stands()
     let quote = Block { body: Body::Blocks(vec![line("in", "As they wrote")]), ..Block::new("q", BlockKind::Quote) };
     let blocks = vec![line("a", "Above the quote"), quote, line("b", "Below the quote")];
     let mut window = Harness::open(Document { blocks, ..Document::default() });
+    window.resize(NARROW, 800.0);
     let about = |id: &str, says: &str| note(id, NoteKind::Comment, Anchor::block(id), says);
     window.ui().set_notes(Notes { notes: vec![about("a", "Above it"), about("b", "Below it")], ..Notes::default() });
     caret_at(&mut window, "in", 0);
@@ -1040,6 +1052,7 @@ fn a_step_to_a_note_that_shows_leaves_the_page_where_it_is_read() {
     // A long letter with the caret at its top, read further down where a comment is.
     let line = |n: usize| Block::text(format!("p{n}").as_str(), BlockKind::Paragraph, format!("Item {n} of the works"));
     let mut window = Harness::open(Document { blocks: (0..60).map(line).collect(), ..Document::default() });
+    window.resize(NARROW, 800.0);
     let far = note("far", NoteKind::Comment, Anchor::block("p40"), "Still to do?");
     window.ui().set_notes(Notes { notes: vec![far], ..Notes::default() });
     caret_at(&mut window, "p0", 0);
@@ -1051,4 +1064,181 @@ fn a_step_to_a_note_that_shows_leaves_the_page_where_it_is_read() {
     assert_eq!(reading(&mut window).as_deref(), Some("Still to do?"));
     let after = window.find(Role::Button, "1 comment").map(|marker| marker.bounds);
     assert_eq!(after, Some(marker), "the page is not brought to the caret on the way");
+}
+
+/// The letter in a window with room for cards beside the page, with `notes` on it.
+fn beside(notes: Vec<Note>) -> Harness {
+    let mut window = noted(notes);
+    window.resize(WIDE.0, WIDE.1);
+    window
+}
+
+/// A window with room for the page and the cards of its notes.
+const WIDE: (f32, f32) = (1280.0, 800.0);
+
+/// What an import left on paragraph `b`.
+fn split() -> Note {
+    note("split", NoteKind::Import, Anchor::block("b"), "Merged cells split")
+}
+
+/// The cards beside the page, from the top, once they have come to rest.
+fn cards(window: &mut Harness) -> Vec<Found> {
+    window.advance(1).advance(1000);
+    let card = |found: &Found| found.role == Role::Group && ["Comment", "Import note"].contains(&found.name.as_str());
+    window.controls().into_iter().filter(card).collect()
+}
+
+/// What the card that is open starts with, when one is.
+fn open(window: &mut Harness) -> Option<String> {
+    let controls = window.controls();
+    let open = controls.iter().position(|found| found.role == Role::Group && found.selected == Some(true))?;
+    controls[open..].iter().find(|found| found.role == Role::Paragraph).map(|words| words.name.clone())
+}
+
+#[test]
+fn every_open_note_shows_on_a_card_beside_the_page_in_the_order_of_the_page() {
+    let done = Note { resolved: true, ..note("done", NoteKind::Comment, Anchor::block("b"), "Sent.") };
+    let mut window = beside(vec![split(), slates(), done, chased()]);
+    let said: Vec<String> = said(&mut window).into_iter().map(|(_, words)| words).collect();
+    assert_eq!(said, ["Has anyone chased it?", "Called on Tuesday.", "Welsh ones?", "Merged cells split"]);
+    window.assert_closed(Role::Dialog, "Comments");
+    assert!(markers(&mut window).is_empty(), "a note with a card needs no marker");
+
+    // They stand right of the text, level with their passages or under one another.
+    let text = caret_at(&mut window, "a", 38);
+    let (page, all) = (area(&mut window), cards(&mut window));
+    assert_eq!(all.len(), 3);
+    for (at, card) in all.iter().enumerate() {
+        let (x, right) = (card.bounds.x, card.bounds.x + card.bounds.width);
+        assert!(x > text.x && right <= page.x + page.width, "{at}: beside the text, in the page area");
+        let above = at.checked_sub(1).map_or(page.y, |above| all[above].bounds.y + all[above].bounds.height);
+        assert!(card.bounds.y >= above, "{at}: clear of the card above");
+    }
+    assert!((all[0].bounds.y - text.y).abs() <= text.height, "the first is level with its line: {:?}", all[0].bounds);
+    // The page is written on as before, with the cards beside it.
+    assert!(window.focused().is_some_and(|found| found.role == Role::Document));
+}
+
+#[test]
+fn an_import_note_names_no_one_and_takes_no_reply() {
+    let mut window = beside(vec![split(), slates()]);
+    let who: Vec<String> = said(&mut window).into_iter().map(|(who, _)| who).collect();
+    assert_eq!(who, ["Alice Moreau", "Import note"]);
+    // Opened, a comment has a reply to write and what an import left has none.
+    window.click(Role::Group, "Comment");
+    assert!(window.find(Role::TextInput, "Reply").is_some());
+    window.click(Role::Group, "Import note");
+    assert_eq!(open(&mut window).as_deref(), Some("Merged cells split"));
+    assert!(window.find(Role::TextInput, "Reply").is_none());
+}
+
+#[test]
+fn a_card_comes_to_its_passage_when_the_caret_is_put_there_or_the_card_is_pressed() {
+    // Two comments on one line: the second card stands under the first.
+    let mut window = beside(vec![chased(), slates()]);
+    let line = caret_at(&mut window, "a", 33);
+    let on = spot(&mut window, "a", 33);
+    let rest = cards(&mut window);
+    assert!(rest[1].bounds.y > line.y + line.height && open(&mut window).is_none(), "{:?}", rest[1].bounds);
+
+    // The caret in its passage brings it level with the passage, and the page keeps the keyboard.
+    window.click_at(on);
+    assert_eq!(open(&mut window).as_deref(), Some("Welsh ones?"));
+    let moved = cards(&mut window);
+    assert!((moved[1].bounds.y - line.y).abs() <= line.height, "level with its passage: {:?}", moved[1].bounds);
+    assert!(moved[0].bounds.y + moved[0].bounds.height <= moved[1].bounds.y, "and the card above made room");
+    assert!(window.focused().is_some_and(|found| found.role == Role::Document));
+    // It lets go when the caret leaves the passage.
+    let away = spot(&mut window, "b", 3);
+    window.click_at(away);
+    assert_eq!(open(&mut window), None);
+
+    // A press on a card opens it for a reply, and a press on the page leaves it.
+    let first = cards(&mut window)[0].center();
+    window.click_at(first);
+    assert_eq!(open(&mut window).as_deref(), Some("Has anyone chased it?"));
+    assert!(window.find(Role::TextInput, "Reply").is_some_and(|field| field.focused), "ready for a reply");
+    window.type_text("Twice now.").key("Enter");
+    assert_eq!(window.ui().notes().notes[0].replies.len(), 2);
+    window.click_at(away);
+    assert_eq!(open(&mut window), None);
+    // Escape leaves it too, and the page has the keyboard back.
+    window.click(Role::Group, "Comment").key("Escape");
+    assert_eq!(open(&mut window), None);
+    assert!(window.focused().is_some_and(|found| found.role == Role::Document));
+}
+
+#[test]
+fn a_note_is_resolved_from_its_card() {
+    let mut window = beside(vec![chased(), split()]);
+    let edits = window.ui().edits();
+    // The first card is the comment's.
+    window.click(Role::Button, "Resolve");
+    let resolved: Vec<bool> = window.ui().notes().notes.iter().map(|note| note.resolved).collect();
+    assert_eq!((resolved, window.ui().edits()), (vec![true, false], edits + 1));
+    assert_eq!(cards(&mut window).len(), 1);
+    assert!(!marked(&mut window, "a", QUOTE), "and its passage is marked no more");
+
+    // Not on a document that takes no comments.
+    window.ui().refuse_comments(Some("This document's notes cannot be changed here."));
+    assert!(window.find(Role::Button, "Resolve").is_some_and(|resolve| resolve.disabled));
+}
+
+#[test]
+fn the_cards_keep_inside_the_window_and_lie_over_the_page_where_it_leaves_no_room_beside_it() {
+    // How wide the window is, whether the notes have cards, and whether those lie over the page.
+    let cases = [(1280.0, true, false), (960.0, true, false), (880.0, true, true), (780.0, false, false)];
+    for (width, carded, over) in cases {
+        let mut window = beside(vec![chased()]);
+        window.resize(width, WIDE.1);
+        let (page, all) = (area(&mut window), cards(&mut window));
+        assert_eq!((all.len(), markers(&mut window).len()), (usize::from(carded), usize::from(!carded)), "{width}");
+        assert_eq!(window.find(Role::Button, "Hide comments").is_some(), over, "{width}: only those can be shut");
+        let Some(card) = all.first() else { continue };
+        assert!(card.bounds.x + card.bounds.width < page.x + page.width, "{width}: {:?}", card.bounds);
+        let start = caret_at(&mut window, "a", 0);
+        assert!(start.x >= page.x && card.bounds.x > start.x, "{width}: the page shows from its left margin");
+    }
+}
+
+#[test]
+fn cards_that_lie_over_the_page_can_be_shut_to_read_it_and_opened_again() {
+    let mut window = beside(vec![chased()]);
+    window.resize(880.0, WIDE.1);
+    let before = caret_at(&mut window, "a", 0);
+    window.click(Role::Button, "Hide comments");
+    assert!(cards(&mut window).is_empty(), "nothing lies over the page");
+    assert_eq!(markers(&mut window).len(), 1, "and the note is marked in the margin");
+    assert_eq!(caret_at(&mut window, "a", 0), before, "the page stands where it did");
+
+    // They stay shut while the window is one they would lie over the page in.
+    window.resize(900.0, WIDE.1);
+    assert!(cards(&mut window).is_empty());
+    window.click(Role::Button, "Show comments");
+    assert_eq!(cards(&mut window).len(), 1);
+    assert!(markers(&mut window).is_empty());
+
+    // With room beside the page there is nothing to shut.
+    window.click(Role::Button, "Hide comments");
+    window.resize(WIDE.0, WIDE.1);
+    assert_eq!(cards(&mut window).len(), 1);
+    assert!(window.find(Role::Button, "Show comments").is_none());
+}
+
+#[test]
+fn the_cards_go_with_the_page_as_it_scrolls_and_the_wheel_works_over_them() {
+    let line = |n: usize| Block::text(format!("p{n}").as_str(), BlockKind::Paragraph, format!("Item {n} of the works"));
+    let mut window = Harness::open(Document { blocks: (0..60).map(line).collect(), ..Document::default() });
+    let notes = vec![
+        note("near", NoteKind::Comment, Anchor::range("p3", 0..4), "Done?"),
+        note("far", NoteKind::Comment, Anchor::range("p50", 0..4), "Still to do?"),
+    ];
+    window.ui().set_notes(Notes { notes, ..Notes::default() });
+    let (line, before) = (caret_at(&mut window, "p3", 0), cards(&mut window));
+    assert_eq!(before.len(), 1, "only the card whose passage is near shows");
+
+    window.scroll_at(before[0].center(), 60.0);
+    let (moved, after) = (caret_at(&mut window, "p3", 0), cards(&mut window));
+    assert!(moved.y < line.y, "the wheel over a card scrolls the page");
+    assert_eq!(after[0].bounds.y - before[0].bounds.y, moved.y - line.y, "and the card goes with its line");
 }

@@ -190,11 +190,11 @@ fn toast(window: &mut Harness) -> Option<Found> {
     window.controls().into_iter().find(|found| found.role == Role::Status && found.name.starts_with("Imported"))
 }
 
-/// What the note that is open says first.
+/// What the note says whose card is the open one, of those beside the page.
 fn reading(window: &mut Harness) -> Option<String> {
     let controls = window.controls();
-    let voice = controls.iter().position(|found| found.role == Role::Comment)?;
-    controls[voice..].iter().find(|found| found.role == Role::Paragraph).map(|words| words.name.clone())
+    let open = controls.iter().position(|found| found.role == Role::Group && found.selected == Some(true))?;
+    controls[open..].iter().find(|found| found.role == Role::Paragraph).map(|words| words.name.clone())
 }
 
 #[test]
