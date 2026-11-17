@@ -1185,39 +1185,44 @@ fn a_note_is_resolved_from_its_card() {
 }
 
 #[test]
-fn the_cards_keep_beside_the_page_for_as_long_as_the_window_has_room() {
-    // How wide the window is, whether the notes have cards, and whether a card shows whole while the
-    // page is written on.
-    let cases = [(1280.0, true, true), (960.0, true, true), (880.0, true, false), (780.0, false, false)];
-    for (width, carded, whole) in cases {
+fn the_cards_keep_inside_the_window_and_lie_over_the_page_where_it_leaves_no_room_beside_it() {
+    // How wide the window is, whether the notes have cards, and whether those lie over the page.
+    let cases = [(1280.0, true, false), (960.0, true, false), (880.0, true, true), (780.0, false, false)];
+    for (width, carded, over) in cases {
         let mut window = beside(vec![chased()]);
         window.resize(width, WIDE.1);
         let (page, all) = (area(&mut window), cards(&mut window));
         assert_eq!((all.len(), markers(&mut window).len()), (usize::from(carded), usize::from(!carded)), "{width}");
+        assert_eq!(window.find(Role::Button, "Hide comments").is_some(), over, "{width}: only those can be shut");
         let Some(card) = all.first() else { continue };
+        assert!(card.bounds.x + card.bounds.width < page.x + page.width, "{width}: {:?}", card.bounds);
         let start = caret_at(&mut window, "a", 0);
         assert!(start.x >= page.x && card.bounds.x > start.x, "{width}: the page shows from its left margin");
-        assert_eq!(card.bounds.x + card.bounds.width <= page.x + page.width, whole, "{width}: {:?}", card.bounds);
     }
 }
 
 #[test]
-fn a_card_that_is_pressed_is_pinned_whole_where_the_window_cuts_the_cards() {
+fn cards_that_lie_over_the_page_can_be_shut_to_read_it_and_opened_again() {
     let mut window = beside(vec![chased()]);
     window.resize(880.0, WIDE.1);
     let before = caret_at(&mut window, "a", 0);
-    let peeking = cards(&mut window)[0].center();
-    let page = area(&mut window);
-    window.click_at(Point { x: peeking.x.min(page.x + page.width - 8.0), y: peeking.y });
-    let card = cards(&mut window)[0].bounds;
-    assert!(card.x + card.width <= page.x + page.width, "the card shows whole: {card:?}");
-    let slid = window.ui().selection_ends()[0];
-    assert!(slid.is_none_or(|start| start.x <= before.x), "and the page gave way");
+    window.click(Role::Button, "Hide comments");
+    assert!(cards(&mut window).is_empty(), "nothing lies over the page");
+    assert_eq!(markers(&mut window).len(), 1, "and the note is marked in the margin");
+    assert_eq!(caret_at(&mut window, "a", 0), before, "the page stands where it did");
 
-    // A press on the page pins the page again.
-    window.click_at(Point { x: page.x + 60.0, y: page.y + page.height - 40.0 });
-    let card = cards(&mut window)[0].bounds;
-    assert!(card.x + card.width > page.x + page.width, "the page has its room back: {card:?}");
+    // They stay shut while the window is one they would lie over the page in.
+    window.resize(900.0, WIDE.1);
+    assert!(cards(&mut window).is_empty());
+    window.click(Role::Button, "Show comments");
+    assert_eq!(cards(&mut window).len(), 1);
+    assert!(markers(&mut window).is_empty());
+
+    // With room beside the page there is nothing to shut.
+    window.click(Role::Button, "Hide comments");
+    window.resize(WIDE.0, WIDE.1);
+    assert_eq!(cards(&mut window).len(), 1);
+    assert!(window.find(Role::Button, "Show comments").is_none());
 }
 
 #[test]

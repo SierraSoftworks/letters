@@ -2077,6 +2077,11 @@ impl EditorApp {
             }
             Noting::Resolve => self.edits += u64::from(self.margin.resolve()),
             Noting::ResolveNote(id) => self.edits += u64::from(self.margin.resolve_note(&id)),
+            Noting::Shut(shut) => {
+                // The card that was open does not come back under its passage.
+                self.margin.leave(true);
+                self.cards.set_shut(shut);
+            }
             Noting::PutBack => {
                 let Some(back) = self.put_back() else { return };
                 // The page keeps its place while the block comes back, and then shows it with the version
@@ -2218,7 +2223,7 @@ impl EditorApp {
             let card = Card { note, said, now: &self.margin.now, open, under, refused: refused.is_some() };
             shown.push((top, *tall, card.view()));
         }
-        let left = self.column.0 + self.column.1 + cards::GAP;
+        let left = self.cards.starts(self.column.0 + self.column.1, room.width);
         Some(cards::column(shown, left, room))
     }
 
@@ -4367,7 +4372,7 @@ impl EditorApp {
         // is open: its two versions take the width.
         let carded = self.margin.cards().next().is_some() && self.margin.reviewing().is_none();
         let fit = if carded { cards::fit(text, room.width) } else { Fit::Under };
-        let beside = self.cards.left(fit, self.margin.holds(), (width, room.width));
+        let beside = self.cards.left(fit, (width, room.width));
         let left = beside.unwrap_or(((room.width - width) / 2.0).max(0.0)).round();
         if width != self.column.1 {
             self.layout.update(self.editor.doc(), self.editor.model().style(), width, None);
@@ -6062,11 +6067,13 @@ impl App for EditorApp {
         };
         // The cards of the notes lie over the page area, beside the text.
         let beside = if printing || away { None } else { self.beside(room) };
-        if beside.is_none() {
+        if printing || away {
             self.cards.clear();
         }
+        // Cards that lie over the page can be shut.
+        let drawer = self.cards.shut().map(|shut| cards::drawer(shut, room));
         // What is said at the foot of the page keeps clear of them.
-        let clear = (self.column.0 + self.column.1 + cards::GAP).min(room.width);
+        let clear = self.cards.starts(self.column.0 + self.column.1, room.width).clamp(0.0, room.width);
         let foot = Size { width: if beside.is_some() { clear } else { room.width }, ..room };
         let chapters = if away { None } else { self.chapters() };
         // The find bar hangs under the bars, at the end of the page area.
@@ -6087,7 +6094,8 @@ impl App for EditorApp {
         let news = self.seen.as_ref().filter(|_| self.rewinds() && !away && !self.carded());
         let toast = toast.or_else(|| news.and_then(|seen| seen.toast(foot)));
         // A toast is the first stop after the page, so the cards come after it.
-        let page = Element::row().grow(1.0).child(page).children(toast).children(beside).children(chapters);
+        let page =
+            Element::row().grow(1.0).child(page).children(toast).children(beside).children(drawer).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
         let over = self.dialog.view(&self.settings, self.spelling.mine(), window.height);

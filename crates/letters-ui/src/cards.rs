@@ -3,9 +3,10 @@
 //!
 //! A card stands level with the passage it is about, or under the card before it. The one that is open,
 //! because it was pressed or the caret is in its passage, stands exactly at its passage, and the others
-//! make room above and below it. How much of the column shows follows the rule for two things side by
-//! side ([`fit`]): in a window with no room for it the notes open under their passages instead, as
-//! [`crate::threads`] shows them.
+//! make room above and below it. Where the column stands follows the rule for two things side by side
+//! ([`fit`]): with no room beside the text it lies over the right of the page, inside the window, and
+//! can be shut. In a window narrower still, or with the column shut, the notes open under their passages
+//! instead, as [`crate::threads`] shows them.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -40,10 +41,9 @@ const PADDING: f32 = tokens::SPACE_MD;
 pub(crate) const SAID: f32 = WIDTH - 2.0 * PADDING - 2.0;
 /// How tall the line is that says who speaks, with the button beside it.
 const HEAD: f32 = tokens::CONTROL_HEIGHT_SM;
-/// How many times its own width the page needs for the column to stay beside it, pinned.
-const PINNED: f32 = 1.25;
-/// How long the cards take to make room for the one that opens, and the page to slide under a pin, in
-/// milliseconds.
+/// How many times its own width the page needs for the column to lie over it.
+const OVER: f32 = 1.25;
+/// How long the cards take to make room for the one that opens, in milliseconds.
 const SLIDE_MS: f32 = 150.0;
 
 /// How the cards fit beside the page, by the rule for two things side by side.
@@ -52,22 +52,22 @@ pub(crate) enum Fit {
     /// No room, or no cards: notes open under their passages.
     #[default]
     Under,
-    /// Room for part of the column: the page is pinned to the left edge while it is written on, and the
-    /// column to the right edge while a card is.
-    Pinned,
+    /// Room for part of the column beside the text: it keeps inside the window and lies over the right of
+    /// the page, until it is shut.
+    Over,
     /// Room for both.
     Beside,
 }
 
 /// How the column fits beside text `text` wide in a page area `room` wide. Both show whole where there
-/// is room for both. From 1.25 times the page's own width they stay side by side and one is pinned. With
-/// less the notes go under their passages.
+/// is room for both. From 1.25 times the page's own width the column lies over the page. With less the
+/// notes go under their passages.
 pub(crate) fn fit(text: f32, room: f32) -> Fit {
     let page = text + 2.0 * GUTTER;
     if room >= GUTTER + text + COLUMN {
         Fit::Beside
-    } else if room >= PINNED * page {
-        Fit::Pinned
+    } else if room >= OVER * page {
+        Fit::Over
     } else {
         Fit::Under
     }
@@ -99,10 +99,8 @@ pub(crate) struct Cards {
     open: Option<String>,
     /// How far each card stood from its place when the cards last began to move.
     off: HashMap<String, f32>,
-    /// Whether a card holds the pin, how far the page has slid toward that from 0 to 1, and from where it
-    /// began to.
-    held: bool,
-    slid: (f32, f32),
+    /// Whether the person shut the column that lies over the page.
+    shut: bool,
     /// How much of a move is done, while there is one, and when it began, once a frame has said.
     going: Option<f32>,
     since: Option<u64>,
@@ -111,14 +109,24 @@ pub(crate) struct Cards {
 }
 
 impl Cards {
-    /// Whether the cards show beside the page.
+    /// Whether the cards show.
     pub fn on(&self) -> bool {
-        self.fit != Fit::Under
+        self.fit == Fit::Beside || self.shut() == Some(false)
+    }
+
+    /// Whether the column that lies over the page is shut. `None` where it does not lie over the page.
+    pub fn shut(&self) -> Option<bool> {
+        (self.fit == Fit::Over).then_some(self.shut)
+    }
+
+    /// Shuts the column that lies over the page, or opens it again.
+    pub fn set_shut(&mut self, shut: bool) {
+        self.shut = shut;
     }
 
     /// Takes the cards away, as when the page is.
     pub fn clear(&mut self) {
-        *self = Self { still: self.still, ..Self::default() };
+        *self = Self { still: self.still, shut: self.shut, ..Self::default() };
     }
 
     /// How much of the way a move still has to go.
@@ -130,34 +138,37 @@ impl Cards {
     fn start(&mut self) {
         let rest = self.rest();
         self.off.values_mut().for_each(|off| *off *= rest);
-        self.slid.1 = self.slid.0;
         (self.since, self.going) = (None, (!self.still).then_some(0.0));
     }
 
-    /// Takes how the column fits and whether a card holds the pin. Returns where text `text` wide starts
-    /// across a page area `room` wide: `None` where the cards do not show and the page stands as it does
-    /// without them.
-    pub fn left(&mut self, fit: Fit, held: bool, (text, room): (f32, f32)) -> Option<f32> {
-        if fit == Fit::Under {
+    /// Takes how the column fits. Returns where text `text` wide starts across a page area `room` wide:
+    /// `None` where the cards do not show and the page stands as it does without them.
+    pub fn left(&mut self, fit: Fit, (text, room): (f32, f32)) -> Option<f32> {
+        if self.fit != fit {
             self.clear();
+            self.fit = fit;
+        }
+        if !self.on() {
+            self.clear();
+            self.fit = fit;
             return None;
         }
-        if self.fit != fit {
-            // Cards that come to show, or a window that changes, move nothing by themselves.
-            self.slid = (f32::from(u8::from(held)), f32::from(u8::from(held)));
-            (self.fit, self.held) = (fit, held);
-        } else if self.held != held {
-            self.start();
-            self.held = held;
-        }
-        let goal = f32::from(u8::from(self.held));
-        self.slid.0 = goal + (self.slid.1 - goal) * self.rest();
-        let whole = room - COLUMN - text;
+        let middle = ((room - text) / 2.0).max(0.0);
         Some(match fit {
             // The page keeps to the middle while that leaves the cards their room.
-            Fit::Beside => whole.min((room - text) / 2.0),
-            _ => GUTTER + (whole - GUTTER) * self.slid.0,
+            Fit::Beside => middle.min(room - COLUMN - text),
+            // Cards that lie over the page move nothing.
+            _ => middle,
         })
+    }
+
+    /// Where the cards start across a page area `room` wide, with the text ending at `text`.
+    pub fn starts(&self, text: f32, room: f32) -> f32 {
+        match self.fit {
+            // Inside the window, with room for the shadow.
+            Fit::Over => room - EDGE - WIDTH,
+            _ => text + GAP,
+        }
     }
 
     /// Places the cards: `wants` is each note with where its passage is down the page and how tall its
@@ -341,6 +352,29 @@ pub(crate) fn column(
     column
 }
 
+/// The button that shuts the column that lies over the page, or opens it again, in the top corner of a
+/// page area `room` in size.
+pub(crate) fn drawer(shut: bool, room: letters_render::Size) -> Element<Message> {
+    let (sign, says) = if shut { (icon::MESSAGE_SQUARE, "Show comments") } else { (icon::X, "Hide comments") };
+    let button = Button::icon_only(sign, says).small().on_press(Message::Note(Noting::Shut(!shut)));
+    let side = ControlSize::Small.height();
+    let held = Element::row()
+        .width(side)
+        .height(side)
+        .bg(tokens::SURFACE)
+        .radius(tokens::RADIUS_CARD)
+        .shadow(tokens::SHADOW_CARD)
+        .child(button);
+    Element::column()
+        .overlay()
+        .hollow()
+        .width(room.width)
+        .height(room.height)
+        .padding(Edges { top: EDGE, right: EDGE, ..Edges::all(0.0) })
+        .align(Align::End)
+        .child(held)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,8 +387,8 @@ mod tests {
         let cases = [
             (GUTTER + text + COLUMN + 400.0, Fit::Beside),
             (GUTTER + text + COLUMN, Fit::Beside),
-            (GUTTER + text + COLUMN - 1.0, Fit::Pinned),
-            (1.25 * page, Fit::Pinned),
+            (GUTTER + text + COLUMN - 1.0, Fit::Over),
+            (1.25 * page, Fit::Over),
             (1.25 * page - 1.0, Fit::Under),
             (page, Fit::Under),
         ];
@@ -364,18 +398,21 @@ mod tests {
     }
 
     #[test]
-    fn the_page_is_pinned_while_it_is_written_on_and_the_cards_while_one_is() {
+    fn cards_with_no_room_beside_the_text_lie_over_the_page_inside_the_window_until_they_are_shut() {
         let (text, room) = (600.0, 860.0);
-        let mut cards = Cards { still: true, ..Cards::default() };
-        assert_eq!(cards.left(Fit::Under, false, (text, room)), None);
-        // The page shows whole from its left margin, and what the room leaves of the cards.
-        assert_eq!(cards.left(Fit::Pinned, false, (text, room)), Some(GUTTER));
-        // A card that holds the pin shows whole, to the right edge.
-        let left = cards.left(Fit::Pinned, true, (text, room)).expect("the cards show");
-        assert_eq!(left + text + COLUMN, room);
-        // With room for both, the page keeps to the middle while the cards fit beside it.
-        assert_eq!(cards.left(Fit::Beside, true, (text, 1600.0)), Some(500.0));
-        assert_eq!(cards.left(Fit::Beside, false, (text, 1000.0)), Some(1000.0 - COLUMN - text));
+        let mut cards = Cards::default();
+        assert_eq!(cards.left(Fit::Under, (text, room)), None);
+        assert_eq!(cards.shut(), None, "nothing to shut");
+        // The page stands where it does without them, and the cards end inside the window.
+        assert_eq!(cards.left(Fit::Over, (text, room)), Some((room - text) / 2.0));
+        assert!(cards.starts(730.0, room) + WIDTH < room);
+        cards.set_shut(true);
+        assert_eq!(cards.left(Fit::Over, (text, room)), None);
+        assert_eq!((cards.on(), cards.shut()), (false, Some(true)));
+        // With room for both nothing is shut, and the page keeps to the middle while the cards fit.
+        assert_eq!(cards.left(Fit::Beside, (text, 1600.0)), Some(500.0));
+        assert_eq!(cards.left(Fit::Beside, (text, 1000.0)), Some(1000.0 - COLUMN - text));
+        assert_eq!(cards.starts(900.0, 1000.0), 900.0 + GAP);
     }
 
     #[test]

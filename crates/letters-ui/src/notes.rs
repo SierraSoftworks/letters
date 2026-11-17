@@ -58,6 +58,8 @@ pub enum Noting {
     Resolve,
     /// Resolves a note from its card beside the page.
     ResolveNote(String),
+    /// Shuts the cards that lie over the page, or opens them again.
+    Shut(bool),
     /// Puts the block of the conflict that is open back on the page, as the version that still has it.
     PutBack,
     /// Puts the note that is open away.
@@ -273,12 +275,6 @@ impl Margin {
     /// Whether a note is one that has a card: an open comment or import note.
     pub fn carded(&self, note: &Note) -> bool {
         !note.resolved && Kind::of(note).is_some_and(Kind::carded)
-    }
-
-    /// Whether the card that is open was asked for or is written on, and not just come by with the caret.
-    pub fn holds(&self) -> bool {
-        let written = self.thread.as_ref().is_some_and(|(_, reply)| !reply.is_blank());
-        self.reading().is_some() && (!self.followed || written)
     }
 
     /// Takes the card the caret opened as one the person turned to, since they pressed in it.
