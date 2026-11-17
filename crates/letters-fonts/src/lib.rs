@@ -12,7 +12,6 @@ use std::sync::OnceLock;
 
 use letters_render::Font;
 
-#[cfg(feature = "library")]
 pub mod library;
 
 /// The font files in `fonts/`, in the order [`bundled`] returns their faces. [`provide`] takes their

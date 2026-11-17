@@ -144,7 +144,11 @@ impl Source {
                 ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", file)
             }
             Export::Pdf => {
-                let fonts = Fonts { faces: letters_fonts::bundled() };
+                // The fonts its writer chose are in the file, and it is set in them as the window sets it.
+                let mut faces = letters_fonts::bundled();
+                let held = self.style.fonts().into_iter().filter_map(|font| assets(&font.asset));
+                faces.extend(held.filter(|file| letters_fonts::is_font(file)).map(|file| Font::new(file.into(), 0)));
+                let fonts = Fonts { faces };
                 let info = PdfInfo { title: self.title.clone(), authors: self.authors.clone(), created: Some(now) };
                 let mut backed = |lacking: &[Uncovered]| backups(fallback, lacking);
                 let mut fetched = |address: &str| linked.get(address).map(|picture| picture.bytes.clone());

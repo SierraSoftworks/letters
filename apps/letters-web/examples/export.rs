@@ -90,7 +90,11 @@ pub fn exported(
     let (file, ending, kind) = match format {
         "pdf" => {
             let info = PdfInfo { title: title.to_owned(), authors, created: created.map(|seconds| seconds as u64) };
-            let fonts = Fonts { faces: letters_fonts::bundled() };
+            // The fonts its writer chose come among the assets, and it is set in them as the window is.
+            let mut faces = letters_fonts::bundled();
+            let held = style.fonts().into_iter().filter_map(|font| asset(&font.asset));
+            faces.extend(held.filter(|file| letters_fonts::is_font(file)).map(|file| Font::new(file.into(), 0)));
+            let fonts = Fonts { faces };
             let mut backups = |uncovered: &[Uncovered]| {
                 let (had, faces): (Vec<Face>, Vec<Font>) =
                     BACKUPS.with_borrow(|backups| backups.iter().cloned().unzip());

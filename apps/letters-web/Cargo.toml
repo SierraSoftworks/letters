@@ -23,6 +23,9 @@ skrifa.workspace = true
 letters-editor.workspace = true
 letters-ui.workspace = true
 letters-fonts.workspace = true
+# The faces a style can ask for, and the hash a font file is named by. The editor links both already.
+letters-layout.workspace = true
+sha2.workspace = true
 letters-math.workspace = true
 letters-spell.workspace = true
 letters-trust.workspace = true
@@ -97,7 +100,6 @@ crate-type = ["cdylib"]
 
 [dev-dependencies]
 letters-format.workspace = true
-letters-layout.workspace = true
 letters-test.workspace = true
 zip.workspace = true
 

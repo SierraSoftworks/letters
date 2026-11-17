@@ -32,6 +32,7 @@ pub mod dictionaries;
 pub mod error;
 pub mod export;
 pub mod fetch;
+pub mod fonts;
 pub mod home;
 pub mod ids;
 pub mod import;
@@ -84,6 +85,8 @@ pub struct App {
     /// The browser's editor, when the server was built with one. Without it a browser reads.
     pub editor: Option<Editor>,
     pub fetches: Fetches,
+    /// Where a face of the Google Fonts library is fetched.
+    pub fonts: fonts::Fetch,
     /// What following share links has cost each address of late.
     pub doors: Doors,
     /// What the access logs noted of late.
@@ -112,6 +115,7 @@ impl App {
             rooms,
             editor,
             fetches,
+            fonts: fonts::web(),
             doors,
             log,
             telemetry,
@@ -124,6 +128,11 @@ impl App {
     /// The same server taking another word on who a site is, for tests against a site of their own.
     pub fn with_roots(self, roots: Roots) -> Self {
         Self { fetches: Fetches::new(roots), ..self }
+    }
+
+    /// The same server with another Google Fonts library, for tests.
+    pub fn with_fonts(self, fonts: fonts::Fetch) -> Self {
+        Self { fonts, ..self }
     }
 
     /// The same server whose rooms hold fewer bytes of pictures that wait for their edit, for tests of

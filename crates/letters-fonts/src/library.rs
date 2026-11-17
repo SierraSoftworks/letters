@@ -10,32 +10,51 @@ pub const STYLESHEETS: &str = "fonts.googleapis.com";
 /// The host that holds the faces a stylesheet names.
 pub const FACES: &str = "fonts.gstatic.com";
 
+#[cfg(feature = "library")]
 const LISTED: &str = include_str!("../library.txt");
 
 /// A family of the library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Family {
-    pub name: &'static str,
+pub struct Family<'a> {
+    pub name: &'a str,
     /// The weights it has: `100-900` for all between, else each one.
-    weights: &'static str,
+    weights: &'a str,
     /// Whether it has italics of its own.
     pub italic: bool,
 }
 
+/// The list of the families as `library.txt` writes it, for a server to hand to a page that has none.
+#[cfg(feature = "library")]
+pub fn listing() -> &'static str {
+    LISTED
+}
+
 /// Every family, by name.
-pub fn families() -> impl Iterator<Item = Family> {
-    LISTED.lines().filter(|line| !line.starts_with('#')).filter_map(|line| {
+#[cfg(feature = "library")]
+pub fn families() -> impl Iterator<Item = Family<'static>> {
+    read(LISTED)
+}
+
+/// The family of a name, however its letters are cased.
+#[cfg(feature = "library")]
+pub fn find(name: &str) -> Option<Family<'static>> {
+    find_in(LISTED, name)
+}
+
+/// Every family a [`listing`] names, in its order.
+pub fn read(listing: &str) -> impl Iterator<Item = Family<'_>> {
+    listing.lines().filter(|line| !line.starts_with('#')).filter_map(|line| {
         let mut parts = line.split('\t');
         Some(Family { name: parts.next()?, weights: parts.next()?, italic: parts.next()? == "1" })
     })
 }
 
-/// The family of a name, however its letters are cased.
-pub fn find(name: &str) -> Option<Family> {
-    families().find(|family| family.name.eq_ignore_ascii_case(name.trim()))
+/// The family of a name in a [`listing`], however its letters are cased.
+pub fn find_in<'a>(listing: &'a str, name: &str) -> Option<Family<'a>> {
+    read(listing).find(|family| family.name.eq_ignore_ascii_case(name.trim()))
 }
 
-impl Family {
+impl Family<'_> {
     /// The weight it has nearest to the one asked for, in whole hundreds as the library serves them.
     pub fn weight(&self, asked: u16) -> u16 {
         let asked = (asked.clamp(100, 900) + 50) / 100 * 100;
@@ -70,7 +89,7 @@ pub fn face(stylesheet: &str) -> Option<&str> {
     (path.starts_with('/') && plain && !path.contains("..") && path.ends_with(".ttf")).then_some(address)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "library"))]
 mod tests {
     use super::*;
 

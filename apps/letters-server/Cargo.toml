@@ -22,7 +22,7 @@ letters-spell.workspace = true
 # The read view: a document as HTML, in the window's dark colours where the reader asks for them.
 letters-convert.workspace = true
 letters-ui.workspace = true
-letters-fonts.workspace = true
+letters-fonts = { workspace = true, features = ["library"] }
 # A PDF is laid out here as the window lays it out, with the word lists that end a line of Thai or
 # Chinese between words.
 letters-layout = { workspace = true, features = ["dictionaries"] }

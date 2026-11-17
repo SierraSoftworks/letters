@@ -32,6 +32,13 @@ const FIRST_PAINT_SLOT: &str = "<!--letters:first-paint-->";
 const DOCUMENT_SLOT: &str = "<!--letters:document-->";
 const PRELOAD_SLOT: &str = "<!--letters:preload-->";
 
+/// What is said of a font a document names that the page cannot have.
+pub const NO_FONT: &str =
+    "This document uses the font {}, which is not on this device. Its text is shown in another font.";
+/// What is said of a family of the library that could not be fetched.
+pub const NO_FETCH: &str =
+    "The font {} could not be fetched from Google Fonts. Its text is shown in another font until it can be.";
+
 /// What the Comment tool says of a document whose notes this build cannot read.
 pub const NO_COMMENTS: &str = "Comments cannot be added here: this document's notes are in a form this version of \
                                Letters cannot read.";

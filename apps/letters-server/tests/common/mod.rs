@@ -118,6 +118,11 @@ impl Server {
         Self::over(Scratch::new(name), &|at| settings(at, issuer, oidc), |app| app)
     }
 
+    /// A server whose Google Fonts library is `fonts`.
+    pub fn with_fonts(name: &str, fonts: letters_server::fonts::Fetch) -> Self {
+        Self::over(Scratch::new(name), &sound, |app| app.with_fonts(fonts))
+    }
+
     /// A server whose browsers are sent `editor`.
     pub fn editing(name: &str, editor: Editor) -> Self {
         Self::over(Scratch::new(name), &sound, |app| app.with_editor(Some(editor)))

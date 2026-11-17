@@ -13,6 +13,7 @@
 //! the maths faces of a document without maths, are fetched after the first frame, which has no use for them.
 
 pub mod browser;
+pub mod chosen;
 pub mod faces;
 pub mod input;
 pub mod mirror;

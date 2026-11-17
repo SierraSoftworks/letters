@@ -5,7 +5,7 @@
 //! moves the hidden input under the caret, where the input method's candidate window should open.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::mem;
 use std::ops::Range;
@@ -25,8 +25,9 @@ use letters_render::{Color, DisplayList, Font, Point, Rect, Size};
 use letters_sync::{Client, Link, Local, Progress, Role};
 use letters_trust::{HttpsUrl, LinkDecision, Origin, Trust};
 use letters_ui::{
-    Access, Appearance, Connection, CopyFormat, Cursor, Edge, Keys, LinkPreviewFound, Peer, PictureState, Request,
-    SaveState, Scheme, Settings, Shared, TrustedSource, Uncovered, Window as View, WordList, tokens,
+    Access, Appearance, Connection, CopyFormat, Cursor, Edge, FontOffer, FontSource, Keys, LinkPreviewFound, Named,
+    Notice, Peer, PictureState, Request, SaveState, Scheme, Settings, Shared, TrustedSource, Uncovered, Window as View,
+    WordList, tokens,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
@@ -39,6 +40,7 @@ use web_sys::{
 };
 
 use crate::browser::{self, Browser};
+use crate::chosen::{self, Want};
 use crate::faces::{self, Face};
 use crate::input::{Around, Clipboard, Dom, Finger, Gesture, Held, Reply, TextInput, Touch, modifiers};
 use crate::mirror::{Act, Mirror, Page};
@@ -148,6 +150,8 @@ pub struct Shell {
     extras: Vec<(Extra, Arrival)>,
     /// Those among them that the exports were handed.
     handed: Vec<Extra>,
+    /// The fonts the document's writer chose, as far as the page has come by them.
+    fonts: Chosen,
     /// The characters the window showed without a glyph, until a face that is here has them or none can.
     uncovered: Vec<Uncovered>,
     /// What waits for such files that are on their way, to be told whether any came.
@@ -386,6 +390,7 @@ impl Shell {
                 refetches: 0,
                 extras: Vec::new(),
                 handed: Vec::new(),
+                fonts: Chosen::default(),
                 uncovered: Vec::new(),
                 awaited: Vec::new(),
                 exporting: 0,
@@ -767,7 +772,11 @@ impl Shell {
             Source::Version(version) => version.0.clone(),
             Source::Own | Source::Copy => self.view.editor().doc().clone(),
         };
-        self.gather(&document, move |shell, gathered| match gathered {
+        let style = match &source {
+            Source::Version(version) => version.1.clone(),
+            Source::Own | Source::Copy => self.view.style().clone(),
+        };
+        self.gather(&document, &style, move |shell, gathered| match gathered {
             Ok(()) => shell.export_with(format, source, title, 2, Box::new(then)),
             Err(why) => then(shell, Err(why)),
         });
@@ -800,7 +809,8 @@ impl Shell {
         let assets = Map::new();
         // The linked pictures the window shows go along by their addresses, for a PDF to show them too.
         let held = self.platform.assets.iter().chain(&self.linked);
-        for (name, file) in held.filter(|(name, _)| document.contains(name.as_str())) {
+        // The font files the style lists go along too.
+        for (name, file) in held.filter(|(name, _)| document.contains(name.as_str()) || style.contains(name.as_str())) {
             assets.set(&name.into(), &Uint8Array::from(&file[..]));
         }
         let identity = kept.then(|| match source {
@@ -901,6 +911,9 @@ impl Shell {
     /// they were fetched. What the window before it lacked is no longer asked about.
     fn backed(&mut self) {
         self.uncovered.clear();
+        // Another document's fonts are none of this one's. The library's list holds for the page.
+        self.fonts = Chosen { library: mem::take(&mut self.fonts.library), ..Chosen::default() };
+        self.offer_fonts();
         let fetched: Vec<Font> = self.faces().map(|(_, file)| Font::new(file.clone(), 0)).collect();
         if !fetched.is_empty() {
             self.view.add_fallback_fonts(fetched);
@@ -940,6 +953,172 @@ impl Shell {
         self.uncovered.retain(|_| waits.next() == Some(true));
         let lacking: Vec<Extra> = faces::lacking(&chosen, &asked).into_iter().map(Extra::Face).collect();
         self.fetch_extras(&lacking);
+    }
+
+    /// Whether the person may fetch a family of the library and keep it with the document: one who
+    /// writes a document of a server that they trust.
+    fn keeps_fonts(&self) -> bool {
+        let trusted = self.server.as_ref().is_some_and(|server| server.trust == letters_api::Trust::Trusted);
+        trusted && self.role == Role::Editor
+    }
+
+    /// Offers the library's families in the Font menu, once their list is here.
+    fn offer_fonts(&mut self) {
+        let Listing::Here(library) = &self.fonts.library else { return };
+        let families = letters_fonts::library::read(library).filter(|family| !chosen::BUNDLED.contains(&family.name));
+        let offers = families.map(|family| FontOffer { family: family.name.to_owned(), source: FontSource::Library });
+        self.view.set_families(offers.collect());
+    }
+
+    /// Sets the document in the fonts its writer chose, as far as they can be had: reads the font files
+    /// its style lists, fetches the faces of a family of the library for whoever may keep them, lists
+    /// those in the style once all are here, and says once which families are not to be had.
+    fn choose(&mut self) {
+        self.fonts.named.extend(self.view.take_named());
+        let writes = self.server.is_some() && self.role == Role::Editor;
+        if writes && self.fonts.library == Listing::Unasked {
+            self.list_library();
+        }
+        let style = self.view.style();
+        let (listed, faces) = (style.fonts(), letters_layout::faces(style));
+        let bundled = |face: &Named| chosen::BUNDLED.iter().any(|own| own.eq_ignore_ascii_case(&face.family));
+        if listed.is_empty() && self.fonts.named.is_empty() && faces.iter().all(bundled) {
+            return;
+        }
+        // What the page holds is here, and what no server can give is lost.
+        let mut here = Vec::new();
+        for font in &listed {
+            if self.fonts.files.contains_key(&font.asset) {
+                continue;
+            }
+            let arrival = match self.platform.assets.get(&font.asset) {
+                Some(file) if letters_fonts::is_font(file) => {
+                    here.push(Font::new(file.as_slice().into(), 0));
+                    chosen::Arrival::Here
+                }
+                None if self.server.is_some() => continue,
+                Some(_) | None => chosen::Arrival::Lost,
+            };
+            self.fonts.files.insert(font.asset.clone(), arrival);
+        }
+        if !here.is_empty() {
+            self.view.add_named_fonts(here);
+        }
+        let keeps = self.keeps_fonts();
+        let library = match &self.fonts.library {
+            Listing::Here(library) if keeps => Some(library.clone()),
+            _ => None,
+        };
+        // Until the library's list has come, no family is given up on.
+        let waits = keeps && matches!(self.fonts.library, Listing::Unasked | Listing::Coming);
+        let plan = chosen::plan(&chosen::Known {
+            listed: &listed,
+            faces: &faces,
+            named: &self.fonts.named,
+            library: library.as_deref(),
+            file: &|name| self.fonts.files.get(name).copied(),
+            face: &|want| self.fonts.faces.get(want).copied(),
+        });
+        plan.read.into_iter().for_each(|name| self.read_font(name));
+        plan.fetch.into_iter().for_each(|want| self.fetch_face(want));
+        let coming = self.fonts.faces.values().any(|arrival| *arrival == chosen::Arrival::Coming);
+        if library.is_some() && !coming {
+            // One edit for the whole family, once the last of its faces is here.
+            if let Some(list) = chosen::kept(&listed, &faces, &self.fonts.arrived) {
+                self.view.keep_fonts(&list, &mut self.platform);
+            }
+        }
+        let says =
+            [(plan.lacking, page::NO_FONT, "OK", FONT_KEY), (plan.unfetched, page::NO_FETCH, "Try again", FETCH_KEY)];
+        for (families, sentence, button, key) in says {
+            for family in families.into_iter().filter(|_| !waits) {
+                if self.fonts.said.insert(family.to_lowercase()) {
+                    let sentence = sentence.replace("{}", &family);
+                    self.view.notify(Notice { sentence, button: button.into(), key: format!("{key}{family}") });
+                }
+            }
+        }
+    }
+
+    /// Asks the server for the library's families, once for the page.
+    fn list_library(&mut self) {
+        self.fonts.library = Listing::Coming;
+        let asked = browser::ask(&self.window, "GET", paths::FONTS, None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let listed = asked.await.ok().and_then(|listing| String::from_utf8(listing).ok());
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            // A server without the list offers no library, and the fonts a document names are missing.
+            shell.fonts.library = listed.map_or(Listing::Lost, |listing| Listing::Here(listing.into()));
+            shell.offer_fonts();
+            shell.arrived();
+        });
+    }
+
+    /// Reads a font file the style lists from the document's server.
+    fn read_font(&mut self, name: String) {
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else { return };
+        self.fonts.files.insert(name.clone(), chosen::Arrival::Coming);
+        let asked = browser::ask(&self.window, "GET", &asset(&id, &name), None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let file = asked.await.ok().filter(|file| letters_fonts::is_font(file));
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            // The page may show another document by now.
+            if shell.server.as_ref().is_none_or(|server| server.id != id) {
+                return;
+            }
+            let arrival = match file {
+                Some(file) => {
+                    shell.view.add_named_fonts(vec![Font::new(file.as_slice().into(), 0)]);
+                    // A copy of the document takes its fonts along.
+                    shell.platform.assets.entry(name.clone()).or_insert(file);
+                    chosen::Arrival::Here
+                }
+                None => chosen::Arrival::Lost,
+            };
+            shell.fonts.files.insert(name, arrival);
+            shell.arrived();
+        });
+    }
+
+    /// Fetches a face of the library through the document's server, and keeps its file with the
+    /// document: the server is handed it as it is handed a picture, ahead of the edit that lists it.
+    fn fetch_face(&mut self, want: Want) {
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else { return };
+        self.fonts.faces.insert(want.clone(), chosen::Arrival::Coming);
+        let path = paths::font_face(&id, &want.family, want.weight, want.italic);
+        let asked = browser::ask(&self.window, "GET", &path, None);
+        let shell = self.me.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let file = asked.await.ok().filter(|file| letters_fonts::is_font(file));
+            let Some(shell) = shell.upgrade() else { return };
+            let mut shell = shell.borrow_mut();
+            if shell.server.as_ref().is_none_or(|server| server.id != id) {
+                return;
+            }
+            let arrival = match file {
+                Some(file) => {
+                    let name = chosen::asset_name(&file);
+                    shell.view.add_named_fonts(vec![Font::new(file.as_slice().into(), 0)]);
+                    shell.platform.store_asset(&name, &file);
+                    shell.fonts.files.insert(name.clone(), chosen::Arrival::Here);
+                    shell.fonts.arrived.push((want.clone(), name));
+                    chosen::Arrival::Here
+                }
+                None => chosen::Arrival::Lost,
+            };
+            shell.fonts.faces.insert(want, arrival);
+            shell.arrived();
+        });
+    }
+
+    /// Fetches again the faces of a family that could not be fetched, as its notice offers.
+    fn fetch_again(&mut self, family: &str) {
+        self.fonts.faces.retain(|want, arrival| want.family != family || *arrival != chosen::Arrival::Lost);
+        self.fonts.said.remove(&family.to_lowercase());
     }
 
     /// Fetches the files among `extras` that were never asked for. One that arrives is the window's from
@@ -1380,6 +1559,11 @@ impl Shell {
                 | Request::MakeLink(_)
                 | Request::RevokeLink(_)
                 | Request::AccessLog) => self.share(asked),
+                Request::NoticePressed(key) => {
+                    if let Some(family) = key.strip_prefix(FETCH_KEY) {
+                        self.fetch_again(family);
+                    }
+                }
                 // Moves and folders wait for the server's listings.
                 _ => {}
             }
@@ -1415,6 +1599,9 @@ impl Shell {
         self.keep_up();
         self.go();
         self.cover();
+        if self.stats.fonts {
+            self.choose();
+        }
         if (self.view.needs_paint() || self.touch.gliding()) && !self.frame_due {
             self.frame_due = self.window.request_animation_frame(&self.on_frame).is_ok();
         }
@@ -2674,13 +2861,19 @@ impl Shell {
         });
     }
 
-    /// Fetches the pictures `document` shows that the page never came to show, so that a copy of it
-    /// leaves none out. `then` is told why if one cannot be had.
-    fn gather(&mut self, document: &Document, then: impl FnOnce(&mut Self, Result<(), String>) + 'static) {
+    /// Fetches the pictures `document` shows that the page never came to show, and the font files `style`
+    /// lists, so that a copy of it leaves none out. `then` is told why if one cannot be had.
+    fn gather(
+        &mut self,
+        document: &Document,
+        style: &Style,
+        then: impl FnOnce(&mut Self, Result<(), String>) + 'static,
+    ) {
         let lacking = |name: &&str| !self.platform.assets.contains_key(*name);
-        let (Some(id), names) = (self.server.as_ref().map(|server| server.id.clone()), document.assets()) else {
+        let Some(id) = self.server.as_ref().map(|server| server.id.clone()) else {
             return then(self, Ok(()));
         };
+        let names = document.assets().into_iter().chain(style.assets());
         let asked: Vec<_> = names
             .into_iter()
             .filter(lacking)
@@ -2933,6 +3126,38 @@ impl Extra {
             Self::Words(list) => ("words", list.file()),
         }
     }
+}
+
+/// What the keys of the notices about a document's fonts start with, before the family: one nothing has,
+/// and one of the library that could not be fetched.
+const FONT_KEY: &str = "font:";
+const FETCH_KEY: &str = "font-fetch:";
+
+/// How far the list of the library's families has come.
+#[derive(Clone, Default, PartialEq, Eq)]
+enum Listing {
+    #[default]
+    Unasked,
+    Coming,
+    Here(Rc<str>),
+    /// The server has none to give.
+    Lost,
+}
+
+/// What the page knows of the fonts its document's writer chose.
+#[derive(Default)]
+struct Chosen {
+    library: Listing,
+    /// How far each font file the style lists has come, by its name.
+    files: HashMap<String, chosen::Arrival>,
+    /// How far each face asked of the library has come.
+    faces: HashMap<Want, chosen::Arrival>,
+    /// The faces of the library that came, and the names their files are kept under.
+    arrived: Vec<(Want, String)>,
+    /// The faces the document's text asked for.
+    named: Vec<Named>,
+    /// The families a notice was shown for, in lower case.
+    said: BTreeSet<String>,
 }
 
 /// How far such a file has come.
