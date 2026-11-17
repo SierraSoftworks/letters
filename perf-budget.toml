@@ -5,8 +5,11 @@
 # app holds them itself and fails a measurement that breaks one, on any machine.
 #
 # A CI runner is not that machine, so each kind has limits of its own here, set above what it measures by
-# the spread between its runs. A run over a limit is measured once more, since a runner shares its machine.
-# Over a limit both times, it has made Letters slower there. Find out why, and raise a limit only for a
+# the spread between its runs. A runner shares its machine, which is busy in fits and only ever adds time:
+# - Its launch is read between the fastest launches of Letters and of the empty window, not the medians.
+# - A run over a limit is measured again after a pause, up to three rounds. One round within every limit
+#   passes.
+# Over a limit in all three, it has made Letters slower there. Find out why, and raise a limit only for a
 # cost that was chosen, or for a spread that was seen to be wider.
 
 # The launch here is of a window, on a display in memory with the CPU renderer. The others launch headless.
@@ -16,10 +19,12 @@ launch_ms = 50
 keystroke_median_ms = 3.2
 keystroke_p99_ms = 6
 
+# Its fastest launches are 23 to 47 ms apart (the medians 24 to 85). Its keystrokes take 1.1 to 1.7 ms,
+# 5 ms at p99, on most runners and 1.9 to 2.5 ms, 4.3 to 7.4 ms at p99, on some, which are slower machines.
 [macos-latest]
 launch_ms = 50
-keystroke_median_ms = 1.7
-keystroke_p99_ms = 5
+keystroke_median_ms = 3.2
+keystroke_p99_ms = 8
 
 [windows-latest]
 launch_ms = 95
