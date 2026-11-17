@@ -18,6 +18,8 @@ mod macos;
 mod map;
 #[cfg(target_os = "macos")]
 mod print;
+#[cfg(windows)]
+pub mod printer;
 #[cfg(all(windows, feature = "probe"))]
 pub mod probe;
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), path = "no_wayland.rs")]

@@ -14,7 +14,12 @@ use std::time::{Duration, Instant};
 
 use common::Scratch;
 use letters::app::SAYS;
+use letters::printing;
+use letters_frame::printer::Printer;
 use letters_frame::probe::{self, Probe};
+use letters_render::image::Images;
+use letters_render::pdf::{Info, Pdf};
+use letters_render::{Color, DisplayList, Item, Rect, Size};
 
 /// How long anything a window is waited for may take, on a runner that is slow and busy.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -108,4 +113,38 @@ fn the_bar_is_the_title_bar_and_the_system_keeps_the_frame() {
     let width = inner.right - inner.left;
     window.click(width - unit(22.0), unit(22.0));
     waited("the app to end at a click on Close", || app.0.try_wait().ok().flatten());
+}
+
+/// The printer every Windows has that writes a file, so that nothing is put on paper.
+const TO_A_FILE: &str = "Microsoft Print to PDF";
+
+#[test]
+fn the_pages_asked_for_are_printed() {
+    let Some(printer) = Printer::named(TO_A_FILE) else {
+        // A machine may have had it taken off. Then there is nothing here to print on.
+        eprintln!("not checked: this machine has no printer called {TO_A_FILE:?}");
+        return;
+    };
+    let paper = printer.paper();
+    assert!(paper.width > paper.dots.0 && paper.height > paper.dots.1, "a sheet is more than an inch: {paper:?}");
+
+    // Three pages of A4, each with a block of colour on it.
+    let sheet = Size { width: 793.7, height: 1122.5 };
+    let mut written = Pdf::new();
+    for _ in 0..3 {
+        let block = Rect { x: 96.0, y: 96.0, width: 300.0, height: 200.0 };
+        let list = DisplayList { items: vec![Item::Fill { rect: block, color: Color::rgb(30, 90, 200), radius: 0.0 }] };
+        written.page(sheet, &list, &Images::default(), &[]);
+    }
+    let pdf = written.finish(&Info::default()).expect("the pages are written");
+
+    let desk = Scratch::new("windows-print");
+    let printed = desk.0.join("printed.pdf");
+    printing::print_on(printer, pdf, "Letters test", 2..=3, Some(&printed)).expect("the printer takes the pages");
+    // The printer writes its file once the job is with it, a little after.
+    let pages = waited("the printer's file", || {
+        let read = hayro::hayro_syntax::Pdf::new(fs::read(&printed).ok()?).ok()?;
+        Some(read.pages().len())
+    });
+    assert_eq!(pages, 2, "the second and third page of three were asked for");
 }
