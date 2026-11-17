@@ -151,7 +151,8 @@ async fn folders_the_system_keeps_for_itself_are_not_part_of_a_space() {
     let home = server.scratch.0.join("home/ben");
     // A NAS leaves these beside a person's files, with copies of the documents in some.
     let system = ["@eaDir", "#recycle", "#snapshot", "@tmp", "$RECYCLE.BIN", "System Volume Information", "lost+found"];
-    for name in system.into_iter().chain([".Trashes", "#RECYCLE"]) {
+    // One in a case of its own, and no twin of another here: a disk that folds case would hold the two as one.
+    for name in system.into_iter().chain([".Trashes", "@RECYCLE"]) {
         std::fs::create_dir(home.join(name)).unwrap();
         std::fs::copy(home.join("Diary.let"), home.join(name).join("Diary.let")).unwrap();
     }
