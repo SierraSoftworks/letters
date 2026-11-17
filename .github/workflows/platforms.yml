@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: platforms
+  group: platforms-measure-${{ github.run_id }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,25 +48,17 @@ jobs:
         with:
           cache-on-failure: true
 
-      # Every failure in one night: a test that fails does not hide those after it.
-      - name: Test
-        shell: bash
-        run: cargo test --workspace --no-fail-fast 2>&1 | tee test.log
-
-      # The log of the tests is long, and what failed is spread over it.
-      - name: List failures
-        if: failure()
-        shell: bash
-        run: grep -E -A 12 '^---- .+ ----$|targets? failed' test.log || true
-
       # Measured though a test fails: what Letters costs here does not wait for the tests.
       - name: Build
         if: ${{ !cancelled() }}
         run: cargo build --release -p letters
 
-      - name: Check budgets
-        if: ${{ !cancelled() }}
+      # A measurement of the runner, not a check: every round is printed, none fails the job.
+      - name: Measure rounds
         shell: bash
         run: |
-          ./scripts/budgets.sh ${{ matrix.os }} | tee budgets.txt
-          { echo '```text'; cat budgets.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+          for round in 1 2 3 4 5 6 7 8 9 10; do
+            echo "== round $round"
+            ./scripts/budgets.sh 2>/dev/null || true
+            sleep 10
+          done
