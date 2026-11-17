@@ -238,7 +238,7 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
         signing: HashMap::new(),
         proxy: event_loop.create_proxy(),
         platform: Desktop::new().with_words(Words::of(&home)),
-        library: Library::of(&home),
+        library: Library::of_person(&home),
         seen: Seen::of(&home),
         named: false,
         words: Words::of(&home),
@@ -292,7 +292,8 @@ pub(crate) fn event_loop<T: 'static>(background: bool) -> Result<EventLoop<T>, E
 }
 
 /// What every window starts as, document or not. Its bar is its title bar where the desktop leaves that
-/// to the app: under the system's lights on macOS, and in a frame Letters draws on Linux.
+/// to the app: under the system's lights on macOS, in a frame Letters draws on Linux, and in the border
+/// the system draws on Windows.
 pub(crate) fn window_attributes(event_loop: &ActiveEventLoop) -> WindowAttributes {
     // A Wayland window draws its own corners, which are round: what its frames leave clear must show
     // what is behind it. Elsewhere a window is all its own.
@@ -314,9 +315,19 @@ pub(crate) fn window_attributes(event_loop: &ActiveEventLoop) -> WindowAttribute
         winit::platform::wayland::WindowAttributesExtWayland::with_name(attributes, APP_ID, "letters")
     } else {
         winit::platform::x11::WindowAttributesExtX11::with_name(attributes, APP_ID, "letters")
-            .with_window_icon(window_icon())
+            .with_window_icon(window_icon(include_bytes!("../../../assets/icons/png/app-128.png")))
     };
-    attributes.with_decorations(Host::HERE != Host::Linux)
+    // Windows keeps the border, the shadow and the snapping of a window whose title bar it leaves out.
+    // The taskbar and Alt+Tab show the larger picture, and nothing shows the smaller one.
+    #[cfg(windows)]
+    let attributes = {
+        use winit::platform::windows::WindowAttributesExtWindows;
+        attributes
+            .with_undecorated_shadow(true)
+            .with_window_icon(window_icon(include_bytes!("../../../assets/icons/png/app-32.png")))
+            .with_taskbar_icon(window_icon(include_bytes!("../../../assets/icons/png/app-256.png")))
+    };
+    attributes.with_decorations(!matches!(Host::HERE, Host::Linux | Host::Windows))
 }
 
 /// What the app is called where a person reads its name.
@@ -325,10 +336,9 @@ pub const NAME: &str = "Letters";
 /// The name a desktop knows Letters by: its desktop entry on Linux and its bundle on macOS carry the same.
 pub const APP_ID: &str = "com.sierrasoftworks.Letters";
 
-/// The app's icon, for a desktop that takes it from the window.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn window_icon() -> Option<winit::window::Icon> {
-    let png = include_bytes!("../../../assets/icons/png/app-128.png");
+/// The app's icon from one of its PNGs, for a desktop that takes it from the window.
+#[cfg(not(target_os = "macos"))]
+fn window_icon(png: &[u8]) -> Option<winit::window::Icon> {
     let icon = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.into_rgba8();
     let (width, height) = icon.dimensions();
     winit::window::Icon::from_rgba(icon.into_raw(), width, height).ok()

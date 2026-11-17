@@ -140,6 +140,10 @@ wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 memmap2 = "0.9"
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+# Puts the icon, the version and the manifest into the Windows program, with the system's own compiler.
+winresource = { version = "0.1", default-features = false }
+# Windows, in the version winit brings. The features are what letters-frame asks of the system itself.
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Authentication_Identity", "Win32_System_Com", "Win32_System_Console", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSData", "NSGeometry", "NSProcessInfo", "NSString", "NSThread"] }
 objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSApplication", "NSButton", "NSControl", "NSImage", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }

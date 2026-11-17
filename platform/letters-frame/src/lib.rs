@@ -3,7 +3,9 @@
 //!
 //! Besides the window calls it maps font files into memory ([`map_font`]), which is unsafe for any crate,
 //! asks macOS to download files a sync app keeps in the cloud ([`fetch_cloud_files`]), and gives the bare
-//! program its icon in the Dock ([`set_dock_icon`]).
+//! program its icon in the Dock ([`set_dock_icon`]). On Windows it asks the system what the standard
+//! library does not: the person's name and Documents folder, whether they want animations, and for the
+//! console the program was started from.
 //!
 //! Every call is optional and is there on every system. Each says whether it worked, and where one did
 //! not the app runs as it would without this crate: square corners and no shadow of its own on Wayland, a
@@ -16,8 +18,12 @@ mod macos;
 mod map;
 #[cfg(target_os = "macos")]
 mod print;
+#[cfg(all(windows, feature = "probe"))]
+pub mod probe;
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), path = "no_wayland.rs")]
 pub mod wayland;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(target_os = "macos")]
 pub use cloud::fetch_cloud_files;
@@ -67,6 +73,33 @@ pub struct Lights {
 /// Only macOS has lights to look for. `None` says there are none.
 #[cfg(not(target_os = "macos"))]
 pub fn lights(_window: &impl raw_window_handle::HasWindowHandle) -> Option<Lights> {
+    None
+}
+
+#[cfg(windows)]
+pub use windows::{account_name, animations, attach_console, documents_folder};
+
+/// Only a Windows program can be without the console it was started from. `true` says nothing is missing.
+#[cfg(not(windows))]
+pub fn attach_console() -> bool {
+    true
+}
+
+/// Only Windows keeps a full name the standard library and the shell's tools do not give. `None` says so.
+#[cfg(not(windows))]
+pub fn account_name() -> Option<String> {
+    None
+}
+
+/// Only Windows moves the Documents folder out of the home folder. `None` says it is where it always is.
+#[cfg(not(windows))]
+pub fn documents_folder(_home: &std::path::Path) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Only Windows is asked here whether the person wants animations. `None` says nothing was asked.
+#[cfg(not(windows))]
+pub fn animations() -> Option<bool> {
     None
 }
 

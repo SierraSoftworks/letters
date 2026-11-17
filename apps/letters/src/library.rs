@@ -72,6 +72,17 @@ impl Library {
         Self::at(home.join("Documents").join("Letters"), home.join(".letters").join("recent.json"))
     }
 
+    /// The library of the person at this machine, whose home folder is `home`. The system is asked where
+    /// their Documents folder is, since Windows lets a sync app keep it outside the home folder. A library
+    /// an earlier Letters made in the home folder stays the library.
+    pub fn of_person(home: &Path) -> Self {
+        let usual = Self::of(home);
+        match letters_frame::documents_folder(home) {
+            Some(documents) if !usual.root.is_dir() => Self::at(documents.join("Letters"), usual.memory),
+            _ => usual,
+        }
+    }
+
     pub fn at(root: impl Into<PathBuf>, memory: impl Into<PathBuf>) -> Self {
         Self { root: root.into(), memory: memory.into() }
     }

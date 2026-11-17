@@ -61,7 +61,11 @@ muda.workspace = true
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus.workspace = true
 
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
+
 [dev-dependencies]
+letters-frame = { workspace = true, features = ["probe"] }
 letters-server = { path = "../letters-server" }
 axum.workspace = true
 hayro.workspace = true
