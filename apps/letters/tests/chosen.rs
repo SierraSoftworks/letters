@@ -197,3 +197,39 @@ fn a_family_no_type_names_any_more_leaves_the_list() {
     assert_eq!(after.listed, Some(Vec::new()));
     assert!(after.stored.is_empty());
 }
+
+/// Marks every font in a folder as one that may not be put into a file that is passed on.
+fn forbid_embedding(folder: &Scratch) {
+    for entry in std::fs::read_dir(&folder.0).unwrap() {
+        let file = entry.unwrap().path();
+        let mut bytes = std::fs::read(&file).unwrap();
+        let tables = usize::from(u16::from_be_bytes([bytes[4], bytes[5]]));
+        let record = (0..tables).map(|table| 12 + table * 16).find(|at| &bytes[*at..*at + 4] == b"OS/2").unwrap();
+        let table = u32::from_be_bytes(bytes[record + 8..record + 12].try_into().unwrap()) as usize;
+        bytes[table + 8..table + 10].copy_from_slice(&2u16.to_be_bytes());
+        std::fs::write(&file, bytes).unwrap();
+    }
+}
+
+#[test]
+fn a_document_is_printed_in_the_fonts_it_holds_and_the_systems_that_allow_it() {
+    let (fonts, closed) = (system("chosen-printed"), system("chosen-printed-closed"));
+    forbid_embedding(&closed);
+    let found = Chosen::of(&[], None, library(false).0).answer(&written(&style(LIBRARY), &[]));
+    let held = kept(style(LIBRARY), &found);
+    let on = |folder: &Scratch| Chosen::of(&[&folder.0], None, library(true).0);
+    // The document, the system it is printed on, and how many faces it is given beyond the bundled.
+    let cases = [
+        ("the document's own", &held, &fonts, found.stored.len()),
+        ("the system's", &style(SYSTEM), &fonts, 4),
+        ("a font that forbids it", &style(SYSTEM), &closed, 0),
+        ("bundled families alone", &Style::default(), &fonts, 0),
+        ("a family nothing has", &style("Calibri"), &fonts, 0),
+    ];
+    for (name, style, system, expected) in cases {
+        let mut read =
+            |asset: &str| found.stored.iter().find(|(name, _)| name == asset).map(|(_, bytes)| bytes.clone());
+        let faces = letters::chosen::printed(style, &mut read, || on(system));
+        assert_eq!(faces.len(), expected, "{name}");
+    }
+}

@@ -752,6 +752,8 @@ struct DocWindow {
     fonts_seen: Option<u64>,
     /// The families the person was told are not to be had, each once.
     fonts_said: BTreeSet<String>,
+    /// The font files asked of the document's server, each once.
+    fonts_asked: BTreeSet<String>,
     /// Whether the primary button went down as a secondary one, as it does with Control held on a Mac.
     menu_press: bool,
     /// Whether the document was made in this window, which is what makes it trusted from the start.
@@ -1435,7 +1437,7 @@ impl DocWindow {
     /// Takes what was found of the document's fonts: sets its text in the faces, keeps the font files that
     /// are new with it, and says once which families are not to be had.
     fn chose(&mut self, found: chosen::Found, platform: &mut Desktop) {
-        let chosen::Found { faces, stored, listed, lacking, unfetched } = found;
+        let chosen::Found { faces, stored, listed, lacking, unfetched, absent: _ } = found;
         // The files first: the document's server is handed them before the edit that names them.
         self.keep(stored);
         if !faces.is_empty() {
@@ -2503,6 +2505,7 @@ impl App {
             fonts_named: Vec::new(),
             fonts_seen: None,
             fonts_said: BTreeSet::new(),
+            fonts_asked: BTreeSet::new(),
             menu_press: false,
             made_here,
             vouch: None,
@@ -4594,6 +4597,17 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Brought(id, name, brought) => {
                 let Some(window) = self.windows.get_mut(&id) else { return };
+                if window.fonts_asked.contains(&name) {
+                    // A font file: the copy is to hold it, and the fonts are looked for again with it.
+                    if let Some(bytes) = brought {
+                        window.assets.insert(name, bytes);
+                        window.marks = true;
+                        window.save_at.get_or_insert(now + SAVE_AFTER);
+                    }
+                    window.fonts_seen = None;
+                    window.window.request_redraw();
+                    return;
+                }
                 match brought {
                     Some(bytes) => {
                         // No edit, but the copy is to hold it: it goes in with the next save.
@@ -4640,7 +4654,27 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Chosen(id, found) => {
                 let Some(window) = self.windows.get_mut(&id) else { return };
-                window.chose(*found, &mut self.platform);
+                let mut found = *found;
+                // What the copy of a server's document lacks is asked of the server, as its pictures are.
+                // Until it answers, nobody is told that a family is missing.
+                let absent = std::mem::take(&mut found.absent);
+                let asked: Vec<String> = match &window.remote {
+                    Some(_) => absent.into_iter().filter(|name| window.fonts_asked.insert(name.clone())).collect(),
+                    None => Vec::new(),
+                };
+                if !asked.is_empty() {
+                    found.lacking.clear();
+                }
+                for name in asked {
+                    let Some(remote) = &window.remote else { break };
+                    let (session, document) = (remote.line.session().clone(), remote.opened.id.clone());
+                    let proxy = self.proxy.clone();
+                    self.fetching.run(move || {
+                        let brought = connected::picture(&session, &document, &name);
+                        let _ = proxy.send_event(Event::Brought(id, name, brought));
+                    });
+                }
+                window.chose(found, &mut self.platform);
                 window.sync(now);
             }
             Event::Planned(id, path, plan, to) => self.offer(id, &path, plan, to),

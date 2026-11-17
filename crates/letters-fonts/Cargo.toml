@@ -19,6 +19,6 @@ library = []
 
 [dependencies]
 letters-render.workspace = true
+skrifa.workspace = true
 
 [dev-dependencies]
-skrifa.workspace = true

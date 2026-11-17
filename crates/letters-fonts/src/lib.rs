@@ -117,6 +117,12 @@ pub fn provide_first(file: Vec<u8>) {
 #[cfg(not(feature = "provided"))]
 pub fn provide_first(_file: Vec<u8>) {}
 
+/// Whether `bytes` are a font file that text can be set in. What a document holds under a font's name
+/// is asked this before it is kept or used.
+pub fn is_font(bytes: &[u8]) -> bool {
+    skrifa::FontRef::new(bytes).is_ok()
+}
+
 #[cfg(all(test, feature = "provided"))]
 mod provided {
     // The fonts are one store for the whole process, so one test hands them all over.

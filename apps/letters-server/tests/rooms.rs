@@ -241,7 +241,12 @@ async fn a_picture_is_handed_over_ahead_of_the_edit_that_names_it() {
         who.send(Method::PUT, &paths::asset(&id, name), "image/png", bytes.to_vec()).await.status
     };
     let huge = vec![0; letters_api::Limits::default().asset as usize + 1];
-    let cases: [(&Client, &str, &[u8], StatusCode, &str); 4] = [
+    let font: &[u8] = include_bytes!("../../../crates/letters-math/fonts/KaTeX_AMS-Regular.ttf");
+    let ttf = |bytes: &[u8]| named(bytes).replace(".png", ".ttf");
+    let cases: [(&Client, &str, &[u8], StatusCode, &str); 7] = [
+        (&ada, &ttf(font), font, StatusCode::NO_CONTENT, "a font file a writer chose"),
+        (&ada, &ttf(b"plain text"), b"plain text", StatusCode::BAD_REQUEST, "no font under a font's name"),
+        (&ada, &named(font), font, StatusCode::BAD_REQUEST, "a font under a picture's name"),
         (&guest, &name, PNG, StatusCode::FORBIDDEN, "a reader"),
         (&ada, &named(b"another"), PNG, StatusCode::BAD_REQUEST, "under another picture's name"),
         (&ada, &named(b"plain text"), b"plain text", StatusCode::BAD_REQUEST, "no picture"),

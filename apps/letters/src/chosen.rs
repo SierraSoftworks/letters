@@ -22,9 +22,10 @@ use fontdb::{Database, Source};
 use letters_fonts::library;
 use letters_format::Archive;
 use letters_layout::Named;
-use letters_model::StyleFont;
+use letters_model::{Style, StyleFont};
 use letters_render::{Font, FontBytes};
 use letters_ui::{FontOffer, FontSource};
+use skrifa::raw::TableProvider;
 use ureq::Agent;
 use ureq::config::AutoHeaderValue;
 use ureq::tls::{RootCerts, TlsConfig};
@@ -64,6 +65,8 @@ pub struct Found {
     pub lacking: Vec<String>,
     /// The families of the library that could not be fetched.
     pub unfetched: Vec<String>,
+    /// The font files its style lists that are not to be read here. A document's server may have them.
+    pub absent: Vec<String>,
 }
 
 /// Fetches what is at an address of the library, or nothing.
@@ -122,9 +125,12 @@ impl Chosen {
         // What the document holds, by the family, weight and slant it is listed for.
         let mut has: Vec<&StyleFont> = Vec::new();
         for font in &ask.listed {
-            if let Some(face) = self.stored(ask, &font.asset) {
-                found.faces.push(face);
-                has.push(font);
+            match self.stored(ask, &font.asset) {
+                Some(face) => {
+                    found.faces.push(face);
+                    has.push(font);
+                }
+                None => found.absent.push(font.asset.clone()),
             }
         }
         let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
@@ -229,6 +235,45 @@ impl Chosen {
         }
         found
     }
+}
+
+/// The faces a document is printed in, beyond the bundled ones: the font files it holds, then the
+/// system's own for a family it holds none of. `system` is asked for only then, since reading what a
+/// system has takes a while.
+pub fn printed(
+    style: &Style,
+    read: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    system: impl FnOnce() -> Chosen,
+) -> Vec<Font> {
+    let listed = style.fonts();
+    let stored = listed.iter().filter_map(|font| read(&font.asset));
+    let mut faces: Vec<Font> =
+        stored.filter(|bytes| skrifa::FontRef::new(bytes).is_ok()).map(|bytes| Font::new(bytes.into(), 0)).collect();
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let mut families: Vec<String> = Vec::new();
+    for named in letters_layout::faces(style) {
+        let known = BUNDLED.iter().any(|own| same(own, &named.family))
+            || listed.iter().any(|font| same(&font.family, &named.family))
+            || families.iter().any(|family| same(family, &named.family));
+        if !known {
+            families.push(named.family);
+        }
+    }
+    if !families.is_empty() {
+        let mut system = system();
+        let installed = families.iter().flat_map(|family| system.installed(family));
+        faces.extend(installed.filter(may_embed));
+    }
+    faces
+}
+
+/// Whether a font lets itself be put into a file that is passed on. One that forbids it is not printed
+/// with, and its text is set in a bundled family.
+fn may_embed(font: &Font) -> bool {
+    let read = skrifa::FontRef::from_index(&font.data, font.index).ok();
+    let kind = read.and_then(|face| face.os2().ok().map(|table| table.fs_type()));
+    // The low four bits say how far a font may travel, and 2 alone says nowhere.
+    kind.is_none_or(|kind| kind & 0xF != 2)
 }
 
 /// The name a font file is kept under among a document's assets, which is the same for the same bytes.
