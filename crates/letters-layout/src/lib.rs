@@ -67,6 +67,23 @@ pub use crate::theme::CAPTION_INSET;
 pub use crate::tokens::{Token, TokenKind};
 pub use crate::words::WordList;
 
+/// Every face text set in `style` can ask for: each type's family at its weight and at the weight of bold
+/// text in it, upright and in italics. [`DocLayout::take_named`] tells the faces a page does ask for as
+/// it comes to show them, and this tells them all at once, for whoever must have them before they show:
+/// a shell that keeps a document's fonts with it.
+pub fn faces(style: &letters_model::Style) -> Vec<Named> {
+    let mut faces: Vec<Named> = Vec::new();
+    for of in style.types.values() {
+        for (weight, italic) in [of.weight, leaf::bold(of.weight)].into_iter().flat_map(|w| [(w, false), (w, true)]) {
+            let face = Named { family: of.family.clone(), weight, italic };
+            if !faces.contains(&face) {
+                faces.push(face);
+            }
+        }
+    }
+    faces
+}
+
 /// The fonts layout may use. The shell supplies them, since the core never reads files.
 ///
 /// Text is set in these faces wherever they have its characters, never in the system's. A family the style

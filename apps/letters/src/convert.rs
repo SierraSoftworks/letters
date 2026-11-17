@@ -173,10 +173,13 @@ fn clean(package: &mut Package) {
     package.document.prune_previews();
     // The document says which pictures it shows, so that none is left behind here.
     let shown = package.document.assets();
+    // The style's font files stay with it. A style this build cannot read names none it knows of.
+    let style = package.style().unwrap_or_default();
+    let fonts = style.assets();
     let kept = |name: &str| match name {
         NOTES => false,
         name if name.starts_with(HISTORY) => false,
-        name if name.starts_with(ASSETS) => shown.contains(name),
+        name if name.starts_with(ASSETS) => shown.contains(name) || fonts.contains(name),
         _ => true,
     };
     package.entries.retain(|name, _| kept(name));

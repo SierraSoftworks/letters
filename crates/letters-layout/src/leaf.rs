@@ -445,13 +445,18 @@ pub(crate) fn fit(
     (widths.min, widths.max)
 }
 
+/// The weight bold text is set at in a type of weight `of`. Bold must still stand out in a type that is
+/// already heavy.
+pub(crate) fn bold(of: u16) -> u16 {
+    if of >= 600 { (of + 200).min(900) } else { 700 }
+}
+
 /// How text of type `of` looks under a set of marks. The mark of a formula here means something is wrong
 /// with the text as it stands: a source that could not be typeset, or a reference to nothing.
 fn marked<'a>(of: &'a Type, code: &'a Type, mono: bool, ink: Ink, bits: u8) -> Spec<'a> {
     let mut spec = of.spec(mono, Brush { ink, back: None });
     if bits & marks::BOLD != 0 {
-        // Bold must still stand out in a type that is already heavy.
-        spec.weight = if of.weight >= 600.0 { (of.weight + 200.0).min(900.0) } else { 700.0 };
+        spec.weight = f32::from(bold(of.weight as u16));
     }
     if bits & marks::ITALIC != 0 {
         // Emphasis inside italic text turns upright, as in print.

@@ -14,6 +14,8 @@ workspace = true
 [features]
 # Leaves the fonts out of the binary. The shell fetches the files and hands them over with `provide`.
 provided = []
+# The Google Fonts library: its families by name, and where a face of one is fetched. About 43 KB.
+library = []
 
 [dependencies]
 letters-render.workspace = true

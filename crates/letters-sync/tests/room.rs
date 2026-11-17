@@ -9,7 +9,7 @@ use common::{CREATED, ID, NAME, World, doc, find, note, open_file, save_file, te
 use letters_format::{
     Archive, Error, Files, Journal, OPLOG, Reading, Replica, Saved, WorkingCopy, hash, is_journal, journal_name,
 };
-use letters_model::{Block, BlockKind, Document, Model, Note, NoteKind, Op, ReplicaId, Style};
+use letters_model::{Block, BlockKind, Document, Model, Note, NoteKind, Op, ReplicaId, Style, StyleFont};
 use letters_sync::{Access, LOOK_EVERY, Link, Progress, Role, SAVE_AFTER, SAVE_WITHIN};
 
 const HOME: &str = "/srv/letters/report.let";
@@ -404,6 +404,23 @@ fn a_stop_leaves_alone_a_file_that_lacks_nothing_and_one_that_refuses() {
     world.open_room().unwrap();
     world.advance(SAVE_WITHIN);
     assert_eq!(on_disk(&world)[0], "Two. One. Hello world");
+}
+
+#[test]
+fn a_font_file_is_kept_once_the_style_names_it() {
+    let (mut world, ada, _) = editors();
+    let bytes = b"a font file, as far as anyone here can tell".to_vec();
+    let name = format!("assets/{}.ttf", hash(&bytes).strip_prefix("sha256:").unwrap());
+    world.room.as_mut().unwrap().add_asset(&name, bytes.clone(), &mut world.state, world.now).unwrap();
+    world.advance(SAVE_WITHIN);
+    assert_eq!(world.folder.read_entry(NAME, &name), None, "nothing names it yet");
+
+    let mut style = world.room.as_ref().unwrap().copy().model().style().clone();
+    style.set_fonts(&[StyleFont { family: "Lora".into(), weight: 400, italic: false, asset: name.clone() }]);
+    world.edit(ada, [Op::ReplaceStyle { style }]);
+    world.settle();
+    world.advance(SAVE_WITHIN);
+    assert_eq!(world.folder.read_entry(NAME, &name), Some(bytes), "the file holds it with the style that names it");
 }
 
 #[test]

@@ -362,3 +362,19 @@ fn a_face_a_style_names_is_told_once_and_sets_its_text_when_it_comes() {
     settled(&mut layout);
     assert!(in_chosen(&layout), "and the heading is set in it");
 }
+
+#[test]
+fn a_style_tells_every_face_its_text_can_ask_for() {
+    let mut style = Style::default();
+    style.types.get_mut("heading1").unwrap().family = "Lora".into();
+    let faces = letters_layout::faces(&style);
+    let of = |family: &str| {
+        let mut found: Vec<(u16, bool)> =
+            faces.iter().filter(|face| face.family == family).map(|face| (face.weight, face.italic)).collect();
+        found.sort_unstable();
+        found
+    };
+    assert_eq!(of("Lora"), [(600, false), (600, true), (800, false), (800, true)], "a heading and bold in it");
+    assert!(of(SANS).contains(&(400, true)) && of(SANS).contains(&(700, false)), "the body, slanted and bold");
+    assert_eq!(of(MONO), [(400, false), (400, true), (700, false), (700, true)]);
+}
