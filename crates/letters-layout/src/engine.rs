@@ -344,7 +344,7 @@ impl Engine {
                 locale: None,
             };
             let mut layout = Layout::new();
-            self.build(text, &[spec], &[(0, 0..text.len())], None, &mut layout);
+            self.measure(text, spec, &mut layout);
             layout.break_all_lines(None);
             layout.full_width()
         };
@@ -363,6 +363,14 @@ impl Engine {
         layout: &mut Layout<Brush>,
     ) {
         self.build_with(text, specs, runs, &[], false, locale, BaseDirection::Auto, layout);
+    }
+
+    /// As [`Engine::build`] for one stretch of text that is only measured and shown nowhere: the face it
+    /// asks for is not told as one a page needs.
+    pub fn measure(&mut self, text: &str, spec: Spec, layout: &mut Layout<Brush>) {
+        let told = self.named.0.len();
+        self.build(text, &[spec], &[(0, 0..text.len())], None, layout);
+        self.named.0.truncate(told);
     }
 
     /// As [`Engine::build`], with `boxes` set in the line, each at a U+FFFC of the text. `by_words` keeps a

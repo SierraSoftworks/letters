@@ -348,6 +348,7 @@ fn a_face_a_style_names_is_told_once_and_sets_its_text_when_it_comes() {
         told.iter().any(|named| named.family == family && named.weight == weight && named.italic == italic)
     };
     assert!(has(DISPLAY, 600, false), "the heading's face is told: {told:?}");
+    assert!(!told.iter().any(|named| named.family == MONO), "a type no text is set in asks for no face: {told:?}");
     assert!(has(SANS, 400, false), "and the body's, which a shell knows it has");
     assert!(told.iter().any(|named| named.family == SANS && named.weight > 400 && named.italic), "and a mark's");
     assert!(layout.take_named().is_empty(), "each only once");

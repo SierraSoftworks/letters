@@ -23,7 +23,7 @@ pub struct Style {
 
 /// A face the document holds for a family its style names, so that it reads the same where the family is
 /// not installed. `fonts` in `style.json` lists them.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StyleFont {
     pub family: String,
     pub weight: u16,

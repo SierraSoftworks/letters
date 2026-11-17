@@ -12,7 +12,7 @@ use common::Scratch;
 use letters::chosen::{Ask, Chosen, Fetch, Found, asset_name};
 use letters_format::Package;
 use letters_layout::Named;
-use letters_model::{Document, Style, StyleFont};
+use letters_model::{Document, Style};
 use letters_ui::FontSource;
 
 /// A family of the library, and one that only a system has: a font of the formulas.
