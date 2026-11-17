@@ -18,7 +18,7 @@ letters-editor.workspace = true
 letters-ui.workspace = true
 letters-format.workspace = true
 letters-convert.workspace = true
-letters-fonts.workspace = true
+letters-fonts = { workspace = true, features = ["library"] }
 letters-layout = { workspace = true, features = ["dictionaries"] }
 letters-trust.workspace = true
 letters-spell.workspace = true

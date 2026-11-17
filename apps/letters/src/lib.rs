@@ -7,6 +7,8 @@
 //! - [`words`] keeps the person's own dictionary, [`trust`] what they trust, and [`settings`] what they set.
 //! - [`dictionaries`] finds the system's dictionaries for languages other than English, and [`fallback`]
 //!   its fonts for what the bundled ones cannot draw.
+//! - [`chosen`] finds the faces of the fonts a writer chose: in the document, in the Google Fonts library
+//!   or on the system.
 //! - [`menus`] lists what the macOS menu bar offers, all of it commands the window already has.
 //! - [`update`] looks for a newer release and puts it in this one's place.
 //! - [`measure`] checks the performance budgets, and [`baseline`] is the empty window it compares with.
@@ -17,6 +19,7 @@
 
 pub mod app;
 pub mod baseline;
+pub mod chosen;
 pub mod chrome;
 pub mod cli;
 pub mod conflicts;
