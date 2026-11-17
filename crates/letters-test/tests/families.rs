@@ -1,7 +1,7 @@
 //! Fonts a writer can choose beside the bundled ones: the shell names the families it can find, the bar's
 //! font menu finds one by name, and the window tells its shell which faces to bring.
 
-use letters_model::{Block, BlockKind, Document};
+use letters_model::{Block, BlockKind, Document, StyleFont};
 use letters_render::{Font, Item};
 use letters_test::{Harness, Role};
 use letters_ui::{FontOffer, FontSource};
@@ -76,4 +76,18 @@ fn escape_leaves_the_type_as_it_was() {
     window.click(Role::Button, "Font").click(Role::MenuItem, "More fonts…");
     window.type_text("lora").key("Escape");
     assert_eq!(window.find(Role::Button, "Font").unwrap().description.as_deref(), Some("Inter"));
+}
+
+#[test]
+fn the_font_files_a_shell_stored_are_listed_in_the_style_as_an_edit() {
+    let mut window = letter();
+    let font = StyleFont { family: "Lora".into(), weight: 400, italic: false, asset: "assets/a.ttf".into() };
+    let edits = window.ui().edits();
+    window.keep_fonts(std::slice::from_ref(&font));
+    assert_eq!(window.editor().model().style().fonts(), [font.clone()]);
+    assert!(window.ui().edits() > edits, "the shell can tell there is something to save");
+
+    let edits = window.ui().edits();
+    window.keep_fonts(&[font]);
+    assert_eq!(window.ui().edits(), edits, "a list the style has already is no edit");
 }

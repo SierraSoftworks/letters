@@ -18,7 +18,7 @@ use letters_layout::{
 };
 use letters_model::{
     Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, NoteKind, Notes, Pos,
-    Revision, Selection, Style,
+    Revision, Selection, Style, StyleFont,
 };
 use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
@@ -915,6 +915,19 @@ impl Ui<EditorApp> {
         if app.held(|app| app.layout.add_fonts(&fonts)) {
             // Blocks set again keep their heights as estimates until idle time settles them.
             app.estimated = true;
+        }
+    }
+
+    /// Lists in the document's style the font files the shell has stored among its assets, so that the
+    /// document carries the faces its text is set in: the whole list, which takes the place of the one
+    /// before. It is an edit like any other, and none when the style lists them already.
+    pub fn keep_fonts(&mut self, fonts: &[StyleFont], platform: &mut dyn Platform) {
+        let app = self.app_mut();
+        let mut style = app.editor.model().style().clone();
+        style.set_fonts(fonts);
+        if style != *app.editor.model().style() {
+            let change = app.run(platform, |editor, platform| editor.run(Command::ReplaceStyle(style), platform));
+            app.follow(&change);
         }
     }
 
