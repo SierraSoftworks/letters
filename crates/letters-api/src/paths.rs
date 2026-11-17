@@ -47,6 +47,18 @@ pub fn dictionary_dic(tag: &str) -> String {
     format!("{DICTIONARIES}/{}/dic", segment(tag))
 }
 
+/// `GET`: the families of the Google Fonts library a writer can choose, as `letters_fonts::library` reads
+/// them: a line each of the name, the weights and whether it has italics, apart by tabs.
+pub const FONTS: &str = "/api/v1/fonts";
+
+/// `GET`: one face of a family of [`FONTS`] as a TrueType file, for whoever may write the document `id`.
+/// The server fetches it, so that the library hears of no reader. The weight and the slant are those the
+/// family has: any other is not found.
+pub fn font_face(id: &str, family: &str, weight: u16, italic: bool) -> String {
+    let slant = if italic { "italic" } else { "upright" };
+    format!("/api/v1/documents/{}/fonts/{}/{weight}/{slant}", segment(id), segment(family))
+}
+
 /// `GET`: every [`Space`](crate::Space) the session reaches.
 pub const SPACES: &str = "/api/v1/spaces";
 /// `GET`: the documents the person opened lately, as [`Entry`](crate::Entry)s, newest first.
