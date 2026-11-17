@@ -655,6 +655,13 @@ impl Model {
         self.history.get().map(|history| crdt::authors(&history.loro)).unwrap_or_default()
     }
 
+    /// When the document was last written in, in seconds since 1970, as its history dates its newest
+    /// step. What an import brought is dated by the import's mark, which carries the time the file it
+    /// came from was last changed. `None` for a history that does not say, and where there is none yet.
+    pub fn edited(&self) -> Option<u64> {
+        self.history.get().and_then(|history| versions::edited(&history.loro))
+    }
+
     /// Finds a block by its id, as [`Document::block`] does, without searching the document for it.
     pub fn block(&self, id: &BlockId) -> Option<&Block> {
         nth(&self.doc.blocks, &self.index, self.find(id)?)
@@ -1153,6 +1160,18 @@ impl Model {
     /// and no undo step, and it can be made while an older revision is shown.
     pub fn tag(&mut self, revision: &Revision, kind: TagKind, name: Option<&str>) -> Result<(), HistoryError> {
         self.mark(Tag { kind, name: name.map(str::to_owned), ..self.unnamed(revision) })
+    }
+
+    /// [`Self::tag`] with the mark dated `time`, in seconds since 1970, and not when it is made: for an
+    /// import, whose version is as old as the file it was made of. What is written next is dated as ever.
+    pub fn tag_at(
+        &mut self,
+        revision: &Revision,
+        kind: TagKind,
+        name: Option<&str>,
+        time: u64,
+    ) -> Result<(), HistoryError> {
+        self.mark(Tag { kind, name: name.map(str::to_owned), time, ..self.unnamed(revision) })
     }
 
     /// A mark of this writer's on `revision`, made now.

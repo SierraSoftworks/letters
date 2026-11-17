@@ -6,13 +6,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Cursor, Read, Seek};
+use std::iter;
 use std::sync::Mutex;
 
 use letters_format::{
     ASSETS, Archive, Files, HISTORY, NOTES, OPLOG, Reading, Replica, Save, Saved, WorkingCopy, conflict_copy_of,
     file_name, hash,
 };
-use letters_model::{Block, BlockId, BlockKind, Document, Model, NoteKind, Op, ReplicaId, Style};
+use letters_model::{Block, BlockId, BlockKind, Document, Model, NoteKind, Notes, Op, ReplicaId, Style};
 use serde::{Deserialize, Serialize};
 
 use letters_api::Code;
@@ -51,6 +52,10 @@ pub struct Known {
     pub contributors: Vec<String>,
     /// The import notes nobody has settled.
     pub import_notes: u32,
+    /// When the document was last written in, in seconds since 1970, as the file itself tells: the newest
+    /// edit its history dates, or a comment made after that. `None` where the history does not say.
+    #[serde(default)]
+    pub edited: Option<u64>,
     /// The file's history, when it is known to be sound.
     #[serde(default)]
     sound: Option<Sound>,
@@ -256,7 +261,8 @@ impl Library {
     }
 
     /// Starts a document in the folder at `place` and says where it is. With no `name` it is "Untitled",
-    /// or the first "Untitled 2" and so on that is free.
+    /// or the first "Untitled 2" and so on that is free. `made` is when it is made: now, or before now for
+    /// a document that is started to hold what an older file does.
     pub fn create(
         &self,
         root: &Root,
@@ -264,7 +270,7 @@ impl Library {
         name: Option<&str>,
         style: Style,
         author: &str,
-        now: u64,
+        made: u64,
     ) -> Answer<Place> {
         let stem = match name {
             Some(name) => {
@@ -273,9 +279,9 @@ impl Library {
             None => UNTITLED.into(),
         };
         let replica = ReplicaId::new(&ids::block_id());
-        let mut copy = WorkingCopy::new(ids::document_id(), ids::rfc3339(now), Document::default(), style, replica);
+        let mut copy = WorkingCopy::new(ids::document_id(), ids::rfc3339(made), Document::default(), style, replica);
         // The first line is written as its maker's, which is what names them in the history.
-        copy.sign(author, now);
+        copy.sign(author, made);
         let line = Block::text(BlockId::new(ids::block_id()), BlockKind::Paragraph, "");
         copy.apply([Op::InsertBlock { parent: None, index: 0, block: line }])
             .map_err(|error| Refusal::new(Code::Internal, format!("A document could not be started: {error}.")))?;
@@ -538,30 +544,50 @@ fn index(
 /// until it changes.
 fn read(folder: &Folder, listed: &Listed, was: Option<&Known>) -> Known {
     let (len, modified) = (listed.stamp.len, listed.stamp.modified);
-    let damaged =
-        Known { len, modified, id: None, created: None, contributors: Vec::new(), import_notes: 0, sound: None };
+    let damaged = Known {
+        len,
+        modified,
+        id: None,
+        created: None,
+        contributors: Vec::new(),
+        import_notes: 0,
+        edited: None,
+        sound: None,
+    };
     let Ok(file) = folder.open(&listed.name) else { return damaged };
     let Ok(mut archive) = Archive::open(BufReader::new(file)) else { return damaged };
     let manifest = archive.manifest();
     let (id, created) = (Some(manifest.id.clone()), Some(manifest.created.clone()));
-    let open = |notes: letters_model::Notes| {
-        notes.notes.iter().filter(|note| note.kind == NoteKind::Import && !note.resolved).count() as u32
-    };
-    let import_notes = archive.notes().map(open).unwrap_or(0);
+    let notes = archive.notes().unwrap_or_default();
+    let open = notes.notes.iter().filter(|note| note.kind == NoteKind::Import && !note.resolved);
+    let import_notes = open.count() as u32;
     let history = archive.read(OPLOG).ok().flatten();
     // The history the file had before was checked then, and says the same of who wrote it.
     let same = |was: &&Known| was.sound.as_ref().zip(history.as_deref()).is_some_and(|(sound, now)| sound.is(now));
     if let Some(was) = was.filter(same) {
         let (contributors, sound) = (was.contributors.clone(), was.sound.clone());
-        return Known { len, modified, id, created, contributors, import_notes, sound };
+        // The history dates what it did before. A comment may have been made since.
+        let edited = was.edited.map(|edited| edited.max(commented(&notes)));
+        return Known { len, modified, id, created, contributors, import_notes, edited, sound };
     }
     // Who wrote it is in the history, which is checked first: a folder holds whatever was put there. The
     // replica only reads, so any id will do for it.
     let history = history.filter(|history| Model::check(history).is_ok());
     let sound = history.as_deref().map(Sound::of);
     let model = history.and_then(|history| Model::load(&history, ReplicaId::from(0)).ok());
+    let edited = model.as_ref().and_then(Model::edited).map(|edited| edited.max(commented(&notes)));
     let contributors = model.map(|model| model.authors().into_iter().filter(|name| !name.is_empty()).collect());
-    Known { len, modified, id, created, contributors: contributors.unwrap_or_default(), import_notes, sound }
+    Known { len, modified, id, created, contributors: contributors.unwrap_or_default(), import_notes, edited, sound }
+}
+
+/// When the newest comment or answer of a document was written, in seconds since 1970, or 0. What an
+/// import says of itself is no comment: it is written when the file is brought in, however old the file.
+fn commented(notes: &Notes) -> u64 {
+    let people = notes.notes.iter().filter(|note| note.kind != NoteKind::Import);
+    let times =
+        people.flat_map(|note| iter::once(&note.created).chain(note.replies.iter().map(|reply| &reply.created)));
+    let seconds = |time: &String| u64::try_from(time.parse::<jiff::Timestamp>().ok()?.as_second()).ok();
+    times.filter_map(seconds).max().unwrap_or(0)
 }
 
 /// Opens the document in `archive`, which is the file at `place`, for the server to write on. A folder
@@ -605,6 +631,7 @@ pub(crate) fn wrote(store: &Store, root: &Root, place: &Place, copy: &WorkingCop
         created: Some(copy.created.clone()),
         contributors: copy.model().authors().into_iter().filter(|name| !name.is_empty()).collect(),
         import_notes: open.count() as u32,
+        edited: copy.model().edited().map(|edited| edited.max(commented(&copy.notes))),
         sound: history.as_deref().map(Sound::of),
     };
     let key = file_key(root, place);

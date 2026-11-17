@@ -15,6 +15,7 @@ use super::package::{Element, Package, Rels, parse};
 use super::styles::{ParaProps, Role, RunProps, Styles, Theme, page};
 use super::{DocxError, TASK_DONE, TASK_OPEN};
 use crate::ImportNote;
+use crate::dates::{self, Dates};
 
 /// Text boxes, table cells and content controls nested deeper than this are passed over, which bounds the
 /// reader's recursion.
@@ -44,6 +45,20 @@ pub struct DocxImport {
     pub comments: Vec<Note>,
     /// The pictures the document shows, by the entry name its blocks use.
     pub assets: BTreeMap<String, Vec<u8>>,
+    /// When the file was made and last changed, as Word recorded it.
+    pub dates: Dates,
+}
+
+/// When the file was made and last changed, as the part Word keeps such things in says. A file without the
+/// part, or with one that cannot be read, says nothing: its text is brought in all the same.
+fn recorded(package: &mut Package, part: &str) -> Dates {
+    let Ok(Some(text)) = package.text(part) else { return Dates::default() };
+    let Ok(xml) = parse(part, &text) else { return Dates::default() };
+    let said = |name: &str| {
+        let mut said = xml.root_element().children().filter(|node| node.tag_name().name() == name);
+        said.next().and_then(|node| dates::seconds(node.text()?))
+    };
+    Dates { created: said("created"), modified: said("modified") }
 }
 
 /// Reads a `.docx`.
@@ -60,10 +75,9 @@ pub fn from_docx(
     new_id: &mut dyn FnMut() -> String,
 ) -> Result<DocxImport, DocxError> {
     let mut package = Package::open(bytes)?;
-    let main = match package.rels("")?.part("officeDocument") {
-        Some(main) => main.to_owned(),
-        None => "word/document.xml".to_owned(),
-    };
+    let named = package.rels("")?;
+    let main = named.part("officeDocument").unwrap_or("word/document.xml").to_owned();
+    let dates = recorded(&mut package, named.part("core-properties").unwrap_or("docProps/core.xml"));
     let text = package.text(&main)?.ok_or(DocxError::NotWord)?;
     let xml = parse(&main, &text)?;
     let body = xml.root_element().child("body").ok_or(DocxError::NotWord)?;
@@ -197,7 +211,7 @@ pub fn from_docx(
         }
         _ => Vec::new(),
     };
-    Ok(DocxImport { document, style, notes: reader.notes, comments: notes, assets: reader.assets })
+    Ok(DocxImport { document, style, notes: reader.notes, comments: notes, assets: reader.assets, dates })
 }
 
 /// The paragraphs after which a new page starts because a section ends there. A section says how it starts

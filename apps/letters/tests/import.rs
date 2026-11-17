@@ -72,6 +72,34 @@ fn a_plan_says_where_a_files_pictures_are() {
 }
 
 #[test]
+fn a_document_is_as_old_as_the_file_it_was_made_of() {
+    let folder = Folder::new("dates");
+    // 7 June 2021, 08:09:10 in UTC.
+    let changed = 1_623_053_350;
+    let word = to_docx(&Document::default(), &Style::default(), &Notes::default(), "Quote", &mut |_| None);
+    let dated = "---\ndate: 2019-05-04\n---\n\nWords.\n";
+    // The file, and when its document was made: when the file says, or else no later than it last changed.
+    let cases: [(&str, Vec<u8>, Option<&str>); 3] = [
+        ("Plain.md", "Words.".into(), None),
+        ("Dated.md", dated.into(), Some("2019-05-04T00:00:00Z")),
+        ("Quote.docx", word, None),
+    ];
+    for (name, bytes, said) in cases {
+        let source = folder.write(name, bytes);
+        let last = std::time::UNIX_EPOCH + std::time::Duration::from_secs(changed);
+        fs::File::options().write(true).open(&source).unwrap().set_modified(last).unwrap();
+
+        let plan = Plan::of(&source, &Style::default()).expect(name);
+        let imported = plan.import(&Choices::default());
+        assert_eq!(imported.modified, changed, "{name}: last changed when the file was");
+        match said {
+            Some(said) => assert_eq!(imported.package.created, said, "{name}"),
+            None => assert_eq!(imported.package.created, "2021-06-07T08:09:10Z", "{name}"),
+        }
+    }
+}
+
+#[test]
 fn pictures_come_from_the_folders_that_were_chosen() {
     let folder = Folder::new("choices");
     let source = notes(&folder);

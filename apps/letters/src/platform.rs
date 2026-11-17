@@ -132,9 +132,14 @@ pub fn document_id() -> String {
     format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])
 }
 
+/// The current time, in seconds since 1970.
+pub fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs())
+}
+
 /// The current time as RFC 3339, in UTC.
 pub fn now_rfc3339() -> String {
-    rfc3339(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs()))
+    rfc3339(now())
 }
 
 /// How far the person's clock is ahead of UTC right now, in minutes. Behind UTC it is negative.

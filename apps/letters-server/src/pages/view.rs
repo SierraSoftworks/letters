@@ -517,6 +517,8 @@ fn folder(folder: &Folder) -> Html {
                     <form id="import-form" method="post" action={ACT_IMPORT} enctype="multipart/form-data">
                         { hidden("space", &space.id) }
                         { hidden("folder", &folder.path) }
+                        // Filled by the page's script with when the chosen file was last changed.
+                        { hidden("modified", "") }
                         <FileDrop
                             name="file"
                             accept=".md,.markdown,.docx"

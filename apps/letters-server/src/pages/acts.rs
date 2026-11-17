@@ -71,7 +71,7 @@ impl Within {
 /// Starts a document and opens it.
 async fn new_document(State(app): State<Shared>, Visitor(who): Visitor, Form(within): Form<Within>) -> Response {
     done(app, within.page(), move |app| {
-        let new = NewDocument { folder: within.folder, name: None };
+        let new = NewDocument { folder: within.folder, ..NewDocument::default() };
         let entry = app.new_document(&who, &within.space, &new)?;
         Ok(paths::editor_page(&entry.id.unwrap_or_default()))
     })
@@ -80,7 +80,7 @@ async fn new_document(State(app): State<Shared>, Visitor(who): Visitor, Form(wit
 
 /// Makes a document of the Markdown or Word file a form carries, and opens it.
 async fn import(State(app): State<Shared>, Visitor(who): Visitor, mut form: Multipart) -> Response {
-    let (mut space, mut folder, mut file) = (String::new(), String::new(), None);
+    let (mut space, mut folder, mut file, mut modified) = (String::new(), String::new(), None, None);
     // A form that stops short was cut off at what a form may weigh.
     let mut whole = true;
     loop {
@@ -96,6 +96,8 @@ async fn import(State(app): State<Shared>, Visitor(who): Visitor, mut form: Mult
         match named.as_str() {
             "space" => space = field.text().await.unwrap_or_default(),
             "folder" => folder = field.text().await.unwrap_or_default(),
+            // When the file was last changed, which the page's script reads off the file that was chosen.
+            "modified" => modified = field.text().await.ok().and_then(|seconds| seconds.parse::<u64>().ok()),
             "file" => {
                 let name = field.file_name().unwrap_or_default().to_owned();
                 match field.bytes().await {
@@ -112,7 +114,7 @@ async fn import(State(app): State<Shared>, Visitor(who): Visitor, mut form: Mult
             return Err(Refusal::new(Code::TooLarge, "The file is larger than the server takes."));
         }
         let (name, file) = file.ok_or_else(|| Refusal::invalid("Choose a Markdown or Word file to import."))?;
-        let entry = app.import(&who, &space, &folder, &name, &file)?;
+        let entry = app.import(&who, &space, &folder, &name, &file, modified)?;
         Ok(paths::editor_page(&entry.id.unwrap_or_default()))
     })
     .await

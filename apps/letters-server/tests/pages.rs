@@ -321,6 +321,13 @@ async fn a_folders_page_takes_a_file_to_make_a_document_of_and_opens_it() {
     assert_eq!(names(&rows), ["Roof"]);
     assert_eq!(made.location(), paths::editor_page(rows[0].id.as_deref().unwrap()), "the document is opened");
 
+    // The page's script tells when the chosen file was last changed, and the document is as old.
+    assert!(page(&mut ben, &here).await.contains("name=\"modified\""), "the form can say it");
+    let dated = [("space", "family"), ("folder", ""), ("modified", "1623053350")];
+    ben.hand(ACT_IMPORT, &dated, ("Old.md", b"Old words."), URL).await;
+    let old = listed(&ben, "family", "").await.into_iter().find(|row| row.name == "Old").expect("it is listed");
+    assert_eq!((old.created.as_deref(), old.modified), (Some("2021-06-07T08:09:10Z"), 1_623_053_350));
+
     // What is no file to import says so on the folder's page, and so does a form with no file.
     for (name, file) in [("Roof.pdf", &b"%PDF-1.7 \xff\xfe"[..]), ("", &b""[..])] {
         let refused = ben.hand(ACT_IMPORT, &within, (name, file), URL).await;
@@ -332,7 +339,7 @@ async fn a_folders_page_takes_a_file_to_make_a_document_of_and_opens_it() {
     assert!(guest.hand(ACT_IMPORT, &within, ("Mine.md", b"Mine."), URL).await.location().contains("error=forbidden"));
     let forged = ben.hand(ACT_IMPORT, &within, ("Theirs.md", b"Theirs."), "https://elsewhere.example").await;
     assert_eq!(forged.status, StatusCode::FORBIDDEN);
-    assert_eq!(names(&listed(&ben, "family", "").await), ["Roof"]);
+    assert_eq!(names(&listed(&ben, "family", "").await), ["Old", "Roof"]);
 }
 
 #[tokio::test]

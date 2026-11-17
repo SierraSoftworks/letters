@@ -109,10 +109,10 @@ async fn a_document_without_a_name_takes_the_first_free_one() {
     let _: Entry = ben.post(&paths::rename(&last), &Rename { name: "Roof repairs".into() }).await.unwrap();
     let opened: Opened = ben.get(&paths::document(&last)).await.unwrap();
     assert!(opened.named && opened.name == "Roof repairs", "{opened:?}");
-    let taken = NewDocument { folder: String::new(), name: Some("Untitled 2".into()) };
+    let taken = NewDocument { folder: String::new(), name: Some("Untitled 2".into()), ..NewDocument::default() };
     let refused = ben.post::<Entry>(&paths::documents("home"), &taken).await.expect_err("the name is taken");
     assert_eq!(refused.code, Code::NameTaken);
-    let unusable = NewDocument { folder: String::new(), name: Some(" ... ".into()) };
+    let unusable = NewDocument { folder: String::new(), name: Some(" ... ".into()), ..NewDocument::default() };
     assert_eq!(ben.post::<Entry>(&paths::documents("home"), &unusable).await.expect_err("no name").code, Code::Invalid);
     assert_eq!(server.scratch.names("home/ben").len(), 3, "nothing half-made is left beside them");
 }
@@ -540,6 +540,66 @@ async fn a_markdown_or_word_file_is_brought_in_as_a_document_that_replaces_nothi
         assert!(marks.iter().any(|mark| mark.kind == TagKind::Import && mark.name.as_deref() == from), "{name}");
     }
     assert_eq!(names(&listed(&ben, "home", "").await), ["Quote", "Quote 2", "Roof", "Roof 2"]);
+}
+
+#[tokio::test]
+async fn a_document_made_of_a_file_is_as_old_as_the_file() {
+    let server = Server::new("import-dates");
+    let ben = server.person("ben", &[]);
+    // 4 May 2019 and 7 June 2021, 08:09:10, both in UTC.
+    let (made, changed) = (1_556_928_000, 1_623_053_350);
+    let dated = "---\ndate: 2019-05-04\nmodified: 2021-06-07T08:09:10Z\n---\n\nWords.\n";
+    // The file, when whoever sent it says it last changed, and when the document was made and changed.
+    type Case = (&'static str, Vec<u8>, Option<u64>, Option<(u64, u64)>);
+    let cases: [Case; 5] = [
+        ("Said.md", dated.into(), Some(changed + 60), Some((made, changed))),
+        ("Sent.md", "Words.".into(), Some(changed), Some((changed, changed))),
+        ("Word.docx", docx("Words."), Some(changed), Some((changed, changed))),
+        // A file nothing is known of is new, and so is one that claims a time to come.
+        ("New.md", "Words.".into(), None, None),
+        ("Early.md", "Words.".into(), Some(common::START + 3600), None),
+    ];
+    for (name, file, sent, expected) in cases {
+        let path = match sent {
+            Some(sent) => paths::import_changed("home", "", name, sent),
+            None => paths::import("home", "", name),
+        };
+        let made = ben.send(Method::POST, &path, "", file).await;
+        assert_eq!(made.status, StatusCode::OK, "{name}: {}", made.text());
+        let entry: Entry = made.json();
+        let created = entry.created.as_deref().and_then(|created| created.parse::<jiff::Timestamp>().ok());
+        let created = created.map(|created| created.as_second() as u64);
+        match expected {
+            Some((made, changed)) => assert_eq!((created, entry.modified), (Some(made), changed), "{name}"),
+            None => assert!(created == Some(common::START) && entry.modified > changed, "{name}: {entry:?}"),
+        }
+        // The folder lists it the same, and its history dates the import as the file was.
+        let row = listed(&ben, "home", "").await.into_iter().find(|row| row.id == entry.id).expect("it is listed");
+        assert_eq!((&row.created, row.modified), (&entry.created, entry.modified), "{name}");
+        let file = ben.send(Method::GET, &paths::file(&entry.id.unwrap()), "", Vec::new()).await.body;
+        let history = Archive::open(Cursor::new(file)).unwrap().read(OPLOG).unwrap().expect("a history");
+        let marks = Model::load(&history, ReplicaId::new("reader")).unwrap().tags();
+        let import = marks.iter().find(|mark| mark.kind == TagKind::Import).expect("the import is marked");
+        assert_eq!(import.time, expected.map_or(common::START, |(_, changed)| changed), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_document_started_for_an_older_file_is_as_old_as_it_says() {
+    let server = Server::new("started-dates");
+    let ben = server.person("ben", &[]);
+    let cases = [
+        (Some("2019-05-04T00:00:00Z"), "2019-05-04T00:00:00Z"),
+        // No time, one that has not come and one that is none: the document is made now.
+        (None, "2027-01-15T08:00:00Z"),
+        (Some("2031-01-01T00:00:00Z"), "2027-01-15T08:00:00Z"),
+        (Some("last spring"), "2027-01-15T08:00:00Z"),
+    ];
+    for (created, expected) in cases {
+        let new = NewDocument { created: created.map(str::to_owned), ..NewDocument::default() };
+        let entry = ben.post::<Entry>(&paths::documents("home"), &new).await.expect("a document starts");
+        assert_eq!(entry.created.as_deref(), Some(expected), "{created:?}");
+    }
 }
 
 /// A picture of one pixel, whole.

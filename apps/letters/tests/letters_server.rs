@@ -679,7 +679,7 @@ fn a_document_is_named_renamed_and_moved_at_its_server() {
     let spaces = session.spaces().unwrap();
     let space = spaces.iter().find(|space| space.kind == SpaceKind::Personal).unwrap().id.clone();
     server.document(&session, "Roof repairs");
-    let id = session.new_document(&space, "", None).unwrap().id.unwrap();
+    let id = session.new_document(&space, "", None, None).unwrap().id.unwrap();
     let home = Scratch::new("placing-home");
     let copy = connected::reach(&session, &id, &home.0).expect("the document is brought here").path;
     let place = |asks: &[Placing]| connected::place(&session, &id, &copy, asks);
@@ -808,14 +808,22 @@ fn a_file_brought_in_on_this_device_is_made_a_document_at_the_server_with_its_pi
     std::fs::write(files.0.join("roof.png"), &picture).unwrap();
     let markdown = "# Rates\n\nRates change in January.\n\n![The roof](roof.png)\n\n![Gone](gone.png)\n";
     std::fs::write(files.0.join("Rates.md"), markdown).unwrap();
+    // The file was last changed on 7 June 2021, and no file system here says it was made before.
+    let changed = 1_623_053_350;
+    let last = std::time::UNIX_EPOCH + Duration::from_secs(changed);
+    std::fs::File::options().write(true).open(files.0.join("Rates.md")).unwrap().set_modified(last).unwrap();
     let bring = |space: &str| {
         let plan = Plan::of(&files.0.join("Rates.md"), &Style::default()).expect("Markdown can be brought in");
         let imported = plan.clone().import(&plan.choices());
-        connected::bring(&ours, space, "", &plan.name, &imported.package, &home.0)
+        connected::bring(&ours, space, "", &plan.name, &imported, &home.0)
     };
 
     let brought = bring(&space.id).expect("the server takes it");
     assert_eq!(brought.opened.name, "Rates", "named after the file");
+    // The server lists it as old as the file, and not as made today.
+    let listed = ours.entries(&space.id, "").expect("the space is listed").entries;
+    let row = listed.iter().find(|entry| entry.name == "Rates").expect("it is listed");
+    assert_eq!((row.created.as_deref(), row.modified), (Some("2021-06-07T08:09:10Z"), changed));
     // Whoever opens it on another device reads all of it, with nothing more said by this one.
     let there = Desk::open(&server, theirs.clone(), &brought.opened.id, "bring-there");
     assert!(there.reads().contains(&"Rates change in January.".to_owned()), "{:?}", there.reads());
@@ -838,7 +846,7 @@ fn a_file_brought_in_on_this_device_is_made_a_document_at_the_server_with_its_pi
     let home = Scratch::new("bring-home-again");
     let bring = |space: &str| {
         let plan = Plan::of(&files.0.join("Rates.md"), &Style::default()).expect("Markdown can be brought in");
-        connected::bring(&ours, space, "", &plan.name, &plan.clone().import(&plan.choices()).package, &home.0)
+        connected::bring(&ours, space, "", &plan.name, &plan.clone().import(&plan.choices()), &home.0)
     };
     let second = bring(&space.id).expect("the next name is free");
     assert_eq!(second.opened.name, "Rates 2");
@@ -933,7 +941,7 @@ fn the_folders_to_move_among_are_listed_whatever_some_of_them_do() {
         folder(parent, name);
     }
     (0..210).for_each(|year| folder("Archive", &format!("Year {year:03}")));
-    let id = session.new_document(&space, "Work/Plans", None).unwrap().id.unwrap();
+    let id = session.new_document(&space, "Work/Plans", None, None).unwrap().id.unwrap();
     let home = Scratch::new("shelves-home");
     let copy = connected::reach(&session, &id, &home.0).expect("the document is brought here").path;
     *server.front.broken.lock().unwrap() = Some("path=Locked".into());

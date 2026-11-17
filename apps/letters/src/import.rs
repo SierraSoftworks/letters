@@ -15,7 +15,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use letters_convert::{DocxError, DocxImport, ImportNote, from_docx, import_markdown};
+use letters_convert::{Dates, DocxError, DocxImport, ImportNote, from_docx, import_markdown};
 use letters_format::Package;
 use letters_model::{Anchor, Document, Note, NoteKind, Notes, Run, Style};
 
@@ -72,6 +72,9 @@ pub struct Imported {
     pub package: Package,
     /// How many passages the import simplified. Each carries a note that says how.
     pub notes: usize,
+    /// When the file was last changed, in seconds since 1970: what the import's version is dated with.
+    /// When it was made is the package's own date.
+    pub modified: u64,
 }
 
 /// How the card that offers a file names a folder its pictures are in, so that the folder's own name is
@@ -139,14 +142,19 @@ pub struct Plan {
     /// The file's folder, which the paths in it start from.
     source: PathBuf,
     folder: PathBuf,
-    created: String,
+    /// When the plan was made, which dates the import's notes.
+    noted: String,
+    /// When the file was made and last changed, as the file system says. What the file says of itself
+    /// comes first.
+    placed: Dates,
     content: Content,
 }
 
 #[derive(Clone, Debug)]
 enum Content {
-    /// The source, which is read again once its pictures are chosen, and the style its document takes.
-    Markdown(String, Box<Style>),
+    /// The source, which is read again once its pictures are chosen, the style its document takes, and
+    /// the dates its front matter gives.
+    Markdown(String, Box<Style>, Dates),
     /// A Word file as it was converted, which no choice changes but for its comments.
     Word(Box<DocxImport>),
 }
@@ -200,11 +208,12 @@ impl Plan {
     /// so that the document looks as it did.
     pub fn of(source: &Path, style: &Style) -> Result<Self, Unplanned> {
         let bytes = fs::read(source).map_err(Unplanned::Unread)?;
+        let placed = placed(source);
         let name = source.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let folder = normal(source.parent().unwrap_or(Path::new("")));
-        let (id, created) = (platform::document_id(), platform::now_rfc3339());
+        let (id, noted) = (platform::document_id(), platform::now_rfc3339());
         if WORD_STARTS.iter().any(|start| bytes.starts_with(start)) {
-            let word = from_docx(&bytes, style, &created, &mut platform::block_id).map_err(Unplanned::Word)?;
+            let word = from_docx(&bytes, style, &noted, &mut platform::block_id).map_err(Unplanned::Word)?;
             let (comments, content) = (word.comments.len(), Content::Word(Box::new(word)));
             return Ok(Self {
                 id,
@@ -215,7 +224,8 @@ impl Plan {
                 comments,
                 source: source.to_owned(),
                 folder,
-                created,
+                noted,
+                placed,
                 content,
             });
         }
@@ -224,10 +234,11 @@ impl Plan {
         };
         // A read that is handed no picture finds out which ones the file names.
         let mut named = Vec::new();
-        import_markdown(&markdown, &mut String::new, &mut |path| {
+        let said = import_markdown(&markdown, &mut String::new, &mut |path| {
             named.push(normal(&folder.join(path)));
             None
         });
+        let said = said.dates;
         named.sort();
         named.dedup();
         let (mut found, mut missing) = (BTreeMap::<PathBuf, usize>::new(), 0);
@@ -241,7 +252,7 @@ impl Plan {
             let beside = path.starts_with(&folder);
             PictureFolder { path, pictures, beside }
         });
-        let content = Content::Markdown(markdown, Box::new(style.clone()));
+        let content = Content::Markdown(markdown, Box::new(style.clone()), said);
         Ok(Self {
             id,
             name,
@@ -251,7 +262,8 @@ impl Plan {
             comments: 0,
             source: source.to_owned(),
             folder,
-            created,
+            noted,
+            placed,
             content,
         })
     }
@@ -262,11 +274,22 @@ impl Plan {
         Choices { pictures: beside.map(|folder| folder.path.clone()).collect(), comments: true }
     }
 
+    /// When the file was made and last changed, in seconds since 1970: as it says of itself, and as the
+    /// file system says where it does not. The document is as old as the file, and not new.
+    pub fn dates(&self) -> (u64, u64) {
+        let said = match &self.content {
+            Content::Word(word) => word.dates,
+            Content::Markdown(.., said) => *said,
+        };
+        said.or(self.placed).settle(platform::now())
+    }
+
     /// Makes the document.
     pub fn import(self, choices: &Choices) -> Imported {
-        let Self { id, folder, created, content, .. } = self;
-        let mut package =
-            Package { id, created: created.clone(), document: Document::default(), entries: Default::default() };
+        let (created, modified) = self.dates();
+        let Self { id, folder, noted, content, .. } = self;
+        let created = platform::rfc3339(created);
+        let mut package = Package { id, created, document: Document::default(), entries: Default::default() };
         let mut notes = Vec::new();
         let simplified = match content {
             Content::Word(word) => {
@@ -277,7 +300,7 @@ impl Plan {
                 notes.extend(word.comments.into_iter().filter(|_| choices.comments));
                 word.notes
             }
-            Content::Markdown(markdown, style) => {
+            Content::Markdown(markdown, style, _) => {
                 let roots: Vec<PathBuf> = choices.pictures.iter().map(|folder| normal(folder)).collect();
                 let mut picture = |path: &str| picture(&normal(&folder.join(path)), &roots);
                 let read = import_markdown(&markdown, &mut platform::block_id, &mut picture);
@@ -290,11 +313,11 @@ impl Plan {
         if package.document.blocks.is_empty() {
             package.document = files::blank();
         }
-        notes.extend(simplified.iter().map(|note| import_note(note, &created)));
+        notes.extend(simplified.iter().map(|note| import_note(note, &noted)));
         if !notes.is_empty() {
             package.set_notes(&Notes { notes, ..Notes::default() });
         }
-        Imported { package, notes: simplified.len() }
+        Imported { package, notes: simplified.len(), modified }
     }
 
     /// The file, as it was named.
@@ -306,6 +329,15 @@ impl Plan {
     pub fn folder(&self) -> &Path {
         &self.folder
     }
+}
+
+/// When the file system says a file was made and last changed. Not every one records when a file was made.
+fn placed(file: &Path) -> Dates {
+    let Ok(about) = fs::metadata(file) else { return Dates::default() };
+    let seconds = |time: io::Result<std::time::SystemTime>| {
+        Some(time.ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
+    };
+    Dates { created: seconds(about.created()), modified: seconds(about.modified()) }
 }
 
 /// The size of a file that could be a picture: one that is there and no larger than an import reads.

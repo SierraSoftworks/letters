@@ -207,9 +207,17 @@ impl Session {
     }
 
     /// Starts a document in `folder` of a space. With no `name` it is "Untitled" there until its first
-    /// heading names it. A name that is taken there is refused as [`Code::NameTaken`].
-    pub fn new_document(&self, space: &str, folder: &str, name: Option<&str>) -> Result<Entry, Refused> {
-        let new = NewDocument { folder: folder.to_owned(), name: name.map(str::to_owned) };
+    /// heading names it. A name that is taken there is refused as [`Code::NameTaken`]. `created` is when
+    /// what it will hold was made, in RFC 3339, for a document made of an older file.
+    pub fn new_document(
+        &self,
+        space: &str,
+        folder: &str,
+        name: Option<&str>,
+        created: Option<&str>,
+    ) -> Result<Entry, Refused> {
+        let (name, created) = (name.map(str::to_owned), created.map(str::to_owned));
+        let new = NewDocument { folder: folder.to_owned(), name, created };
         self.ask(|server, token| server.post(token, &paths::documents(space), &new))
     }
 

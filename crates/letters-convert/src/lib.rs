@@ -5,6 +5,7 @@
 //! read and written whole, styles included. PDF is an export on the pages Print view shows. A web page is read
 //! for what a link preview shows of it.
 
+mod dates;
 mod docx;
 mod figures;
 mod html;
@@ -13,6 +14,7 @@ mod markdown;
 mod pdf;
 mod preview;
 
+pub use dates::Dates;
 pub use docx::{DocxError, DocxImport, from_docx, to_docx};
 pub use html::{Assets, Column, HtmlPage, WebFont, from_html, to_html, to_html_fragment, to_html_themed, to_html_with};
 pub use losses::{Loss, LossKind, Target, losses, losses_with};
