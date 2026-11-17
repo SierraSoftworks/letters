@@ -95,6 +95,36 @@ pub(crate) fn timeline(loro: &LoroDoc) -> Vec<Point> {
     steps(loro).0
 }
 
+/// When the newest step of a history was written, in seconds since 1970: the last that [`timeline`] lists,
+/// found without listing the rest. A step nobody dated, as what an import brought is, is told by the
+/// first mark on it. `None` where neither says.
+pub(crate) fn edited(loro: &LoroDoc) -> Option<u64> {
+    let mut newest: Option<ChangeMeta> = None;
+    for (peer, end) in loro.oplog_vv().iter() {
+        // The replica's last change that is a step: a change that only marks a version is none.
+        let mut counter = *end;
+        while counter > 0 {
+            let Some(part) = loro.get_change(ID::new(*peer, counter - 1)) else { break };
+            counter = part.id.counter;
+            if part.message.as_deref() == Some(MARKING) {
+                continue;
+            }
+            let later = |newest: &ChangeMeta| (newest.lamport, newest.id.peer) < (part.lamport, part.id.peer);
+            if newest.as_ref().is_none_or(later) {
+                newest = Some(part);
+            }
+            break;
+        }
+    }
+    let newest = newest?;
+    if let Some(time) = u64::try_from(newest.timestamp).ok().filter(|time| *time > 0) {
+        return Some(time);
+    }
+    let end = last(&newest);
+    let marks = tags(loro).into_iter().filter(|tag| tag.at.0.iter().any(|id| id == end));
+    marks.map(|tag| tag.time).filter(|time| *time > 0).min()
+}
+
 /// The steps of [`timeline`] that a revision lacks the end of, where `held` is all the revision holds.
 /// A step written apart from the revision is among them wherever it is listed.
 pub(crate) fn since(loro: &LoroDoc, held: &VersionVector) -> Vec<Point> {

@@ -89,6 +89,21 @@ fn a_shell_marks_where_writing_rested_and_leaves_a_name_alone() {
 }
 
 #[test]
+fn an_imports_mark_is_dated_as_its_file_and_what_is_written_next_is_dated_now() {
+    let mut editor = Harness::new("p Slates|");
+    editor.platform.clock = Some(1_800_000_000);
+    let (imported, changed) = (editor.editor.model().revision(), 1_623_053_350);
+    editor.editor.mark_version_at(&imported, TagKind::Import, Some("Quote.md"), changed).expect("a revision here");
+    editor.type_text(" first");
+
+    let points = editor.editor.timeline();
+    let mark = points.iter().flat_map(|point| &point.tags).find(|tag| tag.kind == TagKind::Import);
+    assert_eq!(mark.map(|tag| tag.time), Some(changed));
+    let (written, now) = (points.last().map(|point| point.time), editor.platform.clock);
+    assert!(written == now && now > Some(changed), "{written:?} at {now:?}");
+}
+
+#[test]
 fn a_mark_with_nothing_written_since_the_last_is_not_made() {
     let (mut editor, _) = written();
     let marks = |editor: &mut Harness| editor.editor.timeline().iter().map(|point| point.tags.len()).sum::<usize>();

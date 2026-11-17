@@ -16,13 +16,14 @@ use std::thread;
 use std::time::Duration;
 
 use letters_api::{Access, Code, CreatedLink, Entry, EntryKind, Grant, NewLink, Opened, Shares, paths};
-use letters_format::{Archive, OPLOG, Package, WorkingCopy};
+use letters_format::{Archive, OPLOG, WorkingCopy};
 use letters_model::{Model, Notes, ReplicaId, Selection};
 use letters_sync::{Client as Syncing, Event, Link, Local, MAX_FRAME, Peer, Progress, Refusal};
 use sha2::{Digest, Sha256};
 use ureq::http::Uri;
 
 use crate::files::{self, Working};
+use crate::import::Imported;
 use crate::keychain::Keychain;
 use crate::remote::Roots;
 use crate::server::{Client, Refused};
@@ -166,22 +167,24 @@ const NAMES: u32 = 50;
 /// Starts a document called `name` in `folder` of a space, or by the first of "name 2" and so on that is
 /// free there, as the server names what it imports itself. A name the server cannot give a file is left
 /// to the server.
-fn start(session: &Session, space: &str, folder: &str, name: &str) -> Result<Entry, Refused> {
+fn start(session: &Session, space: &str, folder: &str, name: &str, created: &str) -> Result<Entry, Refused> {
+    let created = Some(created);
     for n in 1..=NAMES {
         let numbered = if n == 1 { name.to_owned() } else { format!("{name} {n}") };
-        match session.new_document(space, folder, Some(&numbered)) {
+        match session.new_document(space, folder, Some(&numbered), created) {
             Err(refused) if refused.code() == Some(Code::NameTaken) => {}
             Err(refused) if n == 1 && refused.code() == Some(Code::Invalid) => break,
             started => return started,
         }
     }
-    session.new_document(space, folder, None)
+    session.new_document(space, folder, None, created)
 }
 
 /// Makes a document at the server of what a file on this device was imported as, in `folder` of a space,
 /// and brings its copy here to open. The document is started as any new one of the server is, called
 /// `name` or by the next name after it that is free, and then written as the import reads: its text, its
-/// style, its pictures and its notes. This waits on the network.
+/// style, its pictures and its notes. It is dated as the file was: made when that was made, and the
+/// import written when that was last changed. This waits on the network.
 ///
 /// The server is handed all of it before this returns, if it can be reached that long: what it could not
 /// be handed stays in the copy, and goes up when the document is opened. What the server will not take
@@ -191,10 +194,10 @@ pub fn bring(
     space: &str,
     folder: &str,
     name: &str,
-    imported: &Package,
+    imported: &Imported,
     home: &Path,
 ) -> Result<Reached, Unreached> {
-    let started = start(session, space, folder, name).map_err(Unreached::Refused)?;
+    let started = start(session, space, folder, name, &imported.package.created).map_err(Unreached::Refused)?;
     let unnamed = || letters_api::Error::new(Code::Internal, "The server did not say which document it started.");
     let id = started.id.ok_or_else(|| Unreached::Refused(Refused::Said(unnamed())))?;
     let reached = reach(session, &id, home)?;
@@ -220,7 +223,8 @@ pub fn bring(
 
 /// Writes what was imported onto the copy of the document a server started for it, as one change to
 /// what the server wrote: the copy then owes the server that change, as it would work done offline.
-fn write_onto(reached: &Reached, imported: &Package) -> io::Result<()> {
+fn write_onto(reached: &Reached, imported: &Imported) -> io::Result<()> {
+    let (imported, modified) = (&imported.package, imported.modified);
     let other = |error: &dyn fmt::Display| io::Error::other(error.to_string());
     let opened = files::open(&reached.path, Default::default).map_err(|error| other(&error))?;
     let home = opened.home.ok_or_else(|| other(&"the copy has no file"))?;
@@ -233,7 +237,8 @@ fn write_onto(reached: &Reached, imported: &Package) -> io::Result<()> {
         model.attach(history);
     }
     model.set_author(&reached.opened.author);
-    model.set_time(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |now| now.as_secs()));
+    // The change is dated as the file was last changed, which is how old what it writes is.
+    model.set_time(modified);
     model.rewrite(imported.document.clone()).map_err(|error| other(&error))?;
     model.rewrite_style(imported.style().map_err(|error| other(&error))?).map_err(|error| other(&error))?;
     copy.edit(&model.save()).map_err(|error| other(&error))?;

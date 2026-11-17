@@ -253,6 +253,10 @@ fn an_address_keeps_each_part_in_its_place() {
             "/api/v1/spaces/family/import?path=House%2F2026&name=Roof%20%26%20co.md",
         ),
         (
+            paths::import_changed("family", "", "Roof.md", 1_623_053_350),
+            "/api/v1/spaces/family/import?path=&name=Roof.md&modified=1623053350",
+        ),
+        (
             paths::import_file("family", "House/Roof & co.md"),
             "/api/v1/spaces/family/files/import?path=House%2FRoof%20%26%20co.md",
         ),

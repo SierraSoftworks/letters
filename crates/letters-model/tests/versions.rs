@@ -62,6 +62,31 @@ fn the_timeline_tells_each_step_with_its_writer_and_time() {
 }
 
 #[test]
+fn a_history_tells_when_it_was_last_written_in() {
+    let (mut ana, mut ben) = writers();
+    assert_eq!(ana.edited(), None, "what a document began with is not dated");
+    // A mark dates what nobody dated, as an import's does with the time its file was last changed.
+    ana.set_time(MORNING - 86_400);
+    ana.tag(&ana.revision(), TagKind::Import, Some("Notes.md")).unwrap();
+    assert_eq!(ana.edited(), Some(MORNING - 86_400));
+
+    ana.set_time(MORNING);
+    ana.apply([typed("p", 11, "!")]).unwrap();
+    assert_eq!(ana.edited(), Some(MORNING));
+    // A mark is no edit, whenever it is made.
+    ana.set_time(MORNING + 1800);
+    ana.tag(&ana.revision(), TagKind::Named, Some("Sent")).unwrap();
+    assert_eq!(ana.edited(), Some(MORNING));
+
+    // Every device says the same, and it is what the newest step of the timeline says.
+    ben.merge(&ana.save()).unwrap();
+    ben.apply([typed("p", 0, "Oh. ")]).unwrap();
+    ana.merge(&ben.save()).unwrap();
+    assert_eq!((ana.edited(), ben.edited()), (Some(MORNING + 3600), Some(MORNING + 3600)));
+    assert_eq!(ana.edited(), ana.timeline().last().map(|step| step.time));
+}
+
+#[test]
 fn every_device_lists_one_history_alike() {
     let (mut ana, mut ben) = writers();
     // Written apart, the two steps have no order of their own.

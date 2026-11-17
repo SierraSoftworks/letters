@@ -1976,7 +1976,7 @@ impl Shell {
         let Some((space, folder)) = self.folder() else { return };
         // A document shared from elsewhere has no folder of the person's: they choose one on the server's pages.
         let Some(space) = space else { return self.leave(paths::HOME_PAGE.to_owned()) };
-        let body = serde_json::to_vec(&letters_api::NewDocument { folder, name: None }).unwrap_or_default();
+        let body = serde_json::to_vec(&letters_api::NewDocument { folder, ..Default::default() }).unwrap_or_default();
         let asked = browser::ask(&self.window, "POST", &paths::documents(&space), Some((letters_api::JSON, &body)));
         let shell = self.me.clone();
         wasm_bindgen_futures::spawn_local(async move {

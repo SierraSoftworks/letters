@@ -144,8 +144,17 @@ fn folder_act(space: &str, path: &str, act: &str) -> String {
 /// nothing is replaced. Which of the two the file is, is told from what it holds. It may be as large as
 /// [`Limits::document`](crate::Limits::document). Answers the document's [`Entry`](crate::Entry), with a
 /// tag for what the import simplified. A file that is neither is [`Code::Invalid`](crate::Code::Invalid).
+///
+/// The document is dated as the file says of itself, as a Word file does. For what the file does not say
+/// see [`import_changed`].
 pub fn import(space: &str, folder: &str, name: &str) -> String {
     format!("{SPACES}/{}/import?path={}&name={}", segment(space), segment(folder), segment(name))
+}
+
+/// [`import`], for a file that was last changed at `modified`, in seconds since 1970, as a browser's
+/// `lastModified` tells in milliseconds. It dates the document where the file says nothing of itself.
+pub fn import_changed(space: &str, folder: &str, name: &str, modified: u64) -> String {
+    format!("{}&modified={modified}", import(space, folder, name))
 }
 
 /// `POST`: makes a document of the Markdown or Word file at `path` in the space, a row tagged

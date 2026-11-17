@@ -367,7 +367,13 @@ fn import_file(
         return failed(&error);
     }
     match write(&output, bytes.get_ref(), false) {
-        Ok(()) => Outcome::Imported { output, notes: imported.notes },
+        Ok(()) => {
+            // The document's file is as old as the file it was made of, wherever files are listed by date.
+            // A file system that will not date a file leaves it dated now.
+            let changed = UNIX_EPOCH + std::time::Duration::from_secs(imported.modified);
+            let _ = fs::File::options().write(true).open(&output).and_then(|file| file.set_modified(changed));
+            Outcome::Imported { output, notes: imported.notes }
+        }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Outcome::Skipped { output },
         Err(error) => failed(&error),
     }

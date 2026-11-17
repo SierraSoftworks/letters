@@ -81,7 +81,9 @@ pub struct Entry {
     /// When the document was made, as its manifest records it in RFC 3339.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
-    /// When its file was last written.
+    /// When it was last written in. That is when its file was last written, unless the file was written
+    /// long after the newest edit or comment it holds, as a copy is and a document made of an older file:
+    /// such a document is as old as what it holds.
     pub modified: u64,
     /// What the session may do with it.
     pub role: Role,
@@ -131,6 +133,10 @@ pub struct NewDocument {
     /// `None` is "Untitled", until the document's first heading names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// When what the document will hold was made, in RFC 3339, for one that is made of an older file.
+    /// `None`, or a time that has not come yet, is now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
 }
 
 /// A folder to make, sent to [`paths::folders`](crate::paths::folders).

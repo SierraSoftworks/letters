@@ -141,9 +141,9 @@ pub enum Event {
     /// known, or why it cannot be brought in.
     /// With where it is to be made, as the card says it, when that is a folder of a server.
     Planned(WindowId, PathBuf, Result<Box<Plan>, Unplanned>, Option<String>),
-    /// A file of this name was brought in for a window and kept as a new document at this path, or could
-    /// not be.
-    Imported(WindowId, String, Result<PathBuf, (Box<Plan>, std::io::Error)>),
+    /// A file of this name, last changed at this time, was brought in for a window and kept as a new
+    /// document at this path, or could not be.
+    Imported(WindowId, (String, u64), Result<PathBuf, (Box<Plan>, std::io::Error)>),
     /// How far the person's clock is ahead of UTC, in minutes.
     Offset(i32),
     /// A picture a window's document links to, at this address, was fetched for this: its file, or why
@@ -175,9 +175,10 @@ pub enum Event {
     Browsed(WindowId, Result<Box<Browsed>, String>),
     /// The server at this address said what is in its trash, for a window's Open card, or why not.
     Trash(WindowId, String, Result<Vec<letters_api::Trashed>, String>),
-    /// The file of this name that a window offered was made a document of at a server and its copy is
-    /// here to open, or it was not, with the file's plan for another try and a sentence on why.
-    MadeThere(WindowId, String, Result<Entered, (Box<Plan>, String)>),
+    /// The file of this name that a window offered, last changed at this time, was made a document of at
+    /// a server and its copy is here to open, or it was not, with the file's plan for another try and a
+    /// sentence on why.
+    MadeThere(WindowId, (String, u64), Result<Entered, (Box<Plan>, String)>),
     /// The socket of this number, to the server of a window's document, has something to say.
     Heard(WindowId, Said),
     /// A picture of this name, which the copy of a window's document lacked, was asked of the document's
@@ -801,8 +802,9 @@ struct DocWindow {
     /// Where the file this window offers is to be made a document, when that is at a server: the
     /// server's address, the space, and the folder in it. `None` for the default folder on this device.
     import_to: Option<(String, String, String)>,
-    /// The name of the file this document was just brought in from, until its history says so.
-    imported: Option<String>,
+    /// The name of the file this document was just brought in from and when that was last changed, in
+    /// seconds since 1970, until its history says so.
+    imported: Option<(String, u64)>,
     /// Journals that were set aside, as the app ended when it last read them, until the window says so.
     aside: Vec<Aside>,
     /// Where the journals are that the window has said were set aside, for the button that shows one.
@@ -952,8 +954,19 @@ impl DocWindow {
     /// Marks a version in the document's history, where the editor finds one worth marking. The mark
     /// goes to the file with the next save.
     fn mark(&mut self, at: &Revision, kind: TagKind, name: Option<&str>) {
+        self.mark_at(at, kind, name, None);
+    }
+
+    /// [`Self::mark`], dated `time` in seconds since 1970 where one is given, and now otherwise.
+    fn mark_at(&mut self, at: &Revision, kind: TagKind, name: Option<&str>, time: Option<u64>) {
         let was = self.view.editor().model().revision();
-        let marked = self.view.change(|editor| editor.mark_version(at, kind, name).map(|()| Change::default()));
+        let marked = self.view.change(|editor| {
+            let marked = match time {
+                Some(time) => editor.mark_version_at(at, kind, name, time),
+                None => editor.mark_version(at, kind, name),
+            };
+            marked.map(|()| Change::default())
+        });
         match marked {
             Ok(()) => self.marks |= self.view.editor().model().revision() != was,
             Err(error) => eprintln!("letters: could not mark a version of {}: {error}", self.name()),
@@ -1831,8 +1844,9 @@ impl DocWindow {
                 let imported = self.imported.take();
                 match &imported {
                     // A document that was just brought in says so, and from what.
-                    Some(source) => {
-                        self.mark(&found, TagKind::Import, Some(source));
+                    // The version is dated as the file was last changed: the document is no newer.
+                    Some((source, modified)) => {
+                        self.mark_at(&found, TagKind::Import, Some(source), Some(*modified));
                         self.save_at = Some(Instant::now() + SAVE_AFTER);
                     }
                     None if self.made_here && self.file().is_none() => {}
@@ -3213,7 +3227,7 @@ impl App {
         thread::spawn(move || {
             let started = match import {
                 true => session.import_file(&space, &at),
-                false => session.new_document(&space, &at, None),
+                false => session.new_document(&space, &at, None, None),
             };
             let started = started.map_err(|refused| connected::sentence(&refused));
             let reached = started.and_then(|entry| {
@@ -3706,7 +3720,7 @@ impl App {
         let chosen =
             plan.folders.iter().filter(|folder| folders.iter().any(|path| *path == folder.path.to_string_lossy()));
         let choices = Choices { pictures: chosen.map(|folder| folder.path.clone()).collect(), comments };
-        let source = window.importing.clone().unwrap_or_default();
+        let source = (window.importing.clone().unwrap_or_default(), plan.dates().1);
         if let Some((server, space, folder)) = window.import_to.clone() {
             let Some(session) = self.sessions.get(&server).filter(|session| !session.ended()).cloned() else {
                 window.plan = Some(plan);
@@ -3717,7 +3731,7 @@ impl App {
             let (proxy, home) = (self.proxy.clone(), self.home.clone());
             thread::spawn(move || {
                 let imported = (*plan).clone().import(&choices);
-                let brought = connected::bring(&session, &space, &folder, &plan.name, &imported.package, &home);
+                let brought = connected::bring(&session, &space, &folder, &plan.name, &imported, &home);
                 let brought = match brought {
                     Ok(reached) => Ok(Box::new((session, reached))),
                     Err(connected::Unreached::Refused(refused)) => Err((plan, connected::sentence(&refused))),
@@ -3750,7 +3764,7 @@ impl App {
         &mut self,
         event_loop: &ActiveEventLoop,
         id: WindowId,
-        source: String,
+        source: (String, u64),
         brought: Result<Entered, (Box<Plan>, String)>,
         now: Instant,
     ) {
@@ -3766,7 +3780,7 @@ impl App {
                     // The card was put away meanwhile, or its window closed.
                     window => alert(
                         window.map(|window| &window.window),
-                        &format!("{source} could not be brought in.\n\n{why}"),
+                        &format!("{} could not be brought in.\n\n{why}", source.0),
                     ),
                 }
                 return;
@@ -3797,13 +3811,13 @@ impl App {
         &mut self,
         event_loop: &ActiveEventLoop,
         id: WindowId,
-        source: String,
+        source: (String, u64),
         kept: Result<PathBuf, (Box<Plan>, std::io::Error)>,
     ) {
         let path = match kept {
             Ok(path) => path,
             Err((plan, error)) => {
-                eprintln!("letters: could not save what was imported from {source}: {error}");
+                eprintln!("letters: could not save what was imported from {}: {error}", source.0);
                 let why = files::unwritten("The document", &error);
                 match self.windows.get_mut(&id) {
                     Some(window) if window.view.importing() => {

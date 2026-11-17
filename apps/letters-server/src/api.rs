@@ -26,7 +26,7 @@ use serde_json::Value;
 use crate::config::Log;
 use crate::error::{Answer, Refusal};
 use crate::ids;
-use crate::library::{Row, untitled};
+use crate::library::{Known, Row, untitled};
 use crate::session::{Carrier, Reader, Signed};
 use crate::spaces::{EXTENSION, Place, Root, seconds, shown, unimported};
 use crate::store::Table;
@@ -219,6 +219,9 @@ struct Brought {
     path: String,
     #[serde(default)]
     name: String,
+    /// When the file was last changed, in seconds since 1970, where whoever sends it knows.
+    #[serde(default)]
+    modified: Option<u64>,
 }
 
 /// `POST`: a Markdown or Word file, to make a document of.
@@ -230,7 +233,7 @@ async fn import(
     body: Result<Bytes, BytesRejection>,
 ) -> Answer<Json<Entry>> {
     let file = body.map_err(|rejection| unread(rejection, "The file is larger than the server takes."))?;
-    blocking(move || app.import(&who, &space, &brought.path, &brought.name, &file).map(Json)).await
+    blocking(move || app.import(&who, &space, &brought.path, &brought.name, &file, brought.modified).map(Json)).await
 }
 
 /// The file in a space to make a document of.
@@ -712,7 +715,12 @@ impl App {
         }
         let (root, folder) = (self.root(who, space)?, Place::parse(&new.folder)?);
         let (style, author) = (self.new_style(who)?, self.signs_as(who)?);
-        let place = self.library.create(&root, &folder, new.name.as_deref(), style, &author, self.now())?;
+        // A document that will hold what an older file does is as old as the file. Nothing is made in
+        // the future, and a time that cannot be read is not one.
+        let now = self.now();
+        let said = new.created.as_deref().and_then(|made| made.parse::<jiff::Timestamp>().ok());
+        let made = said.and_then(|made| u64::try_from(made.as_second()).ok()).filter(|made| (1..=now).contains(made));
+        let place = self.library.create(&root, &folder, new.name.as_deref(), style, &author, made.unwrap_or(now))?;
         self.entry(who, &space.told(role), &root, &place)
     }
 
@@ -1033,11 +1041,26 @@ fn entry(row: &Row, role: Role) -> Entry {
         path: String::new(),
         id: known.and_then(|known| known.id.clone()),
         created: known.and_then(|known| known.created.clone()),
-        modified: seconds(row.listed.stamp),
+        modified: edited(known, seconds(row.listed.stamp)),
         role,
         contributors: known.map(|known| known.contributors.clone()).unwrap_or_default(),
         tags,
     }
+}
+
+/// How closely a history dates an edit, in seconds: one change of it runs on for a minute.
+const DATED_TO: u64 = 120;
+
+/// When a document was last written in, for one whose file was last written at `written`.
+///
+/// A file that was written long after the newest edit or comment it holds did not change then: it was
+/// copied or synced, or it was made of an older file, whose date its history carries. Such a document is
+/// as old as what it holds. Otherwise the file's own time is the closer one. It is also all there is
+/// for a history that dates nothing, or that claims an edit after its file was written, as a device
+/// whose clock runs ahead does.
+fn edited(known: Option<&Known>, written: u64) -> u64 {
+    let dated = known.and_then(|known| known.edited).filter(|edited| *edited > 0);
+    dated.filter(|edited| edited.saturating_add(DATED_TO) < written).unwrap_or(written)
 }
 
 /// The routes with their state, for the server and for tests.

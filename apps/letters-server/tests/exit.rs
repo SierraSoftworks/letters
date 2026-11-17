@@ -509,7 +509,7 @@ fn planned(name: &str) -> (Scratch, Served, String) {
     let scratch = Scratch::new(&format!("exit-{name}"));
     std::fs::create_dir_all(scratch.0.join("family")).expect("the family's folder is made");
     let served = Served::start(&scratch.0, "state");
-    let new = NewDocument { folder: String::new(), name: Some("Plan".into()) };
+    let new = NewDocument { folder: String::new(), name: Some("Plan".into()), ..NewDocument::default() };
     let body = serde_json::to_string(&new).expect("a request is written");
     let (status, made) = served.ask(&served.tokens["ada"], &paths::documents("family"), Some(body));
     assert_eq!(status, 200, "the document is made: {made}");

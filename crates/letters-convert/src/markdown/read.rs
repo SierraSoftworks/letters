@@ -10,6 +10,7 @@ use letters_model::{
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use super::{TAGS, TONES};
+use crate::dates::{self, Dates};
 use crate::html::Assets;
 use crate::{ImportNote, figures};
 
@@ -28,6 +29,8 @@ pub struct MarkdownImport {
     pub notes: Vec<ImportNote>,
     /// The pictures the document shows, by the entry name its blocks use.
     pub assets: BTreeMap<String, Vec<u8>>,
+    /// When the file was made and last changed, where its front matter says.
+    pub dates: Dates,
 }
 
 /// Reads CommonMark and GFM as text alone, as a paste holds it. `new_id` supplies an id for each block.
@@ -58,6 +61,7 @@ pub fn import_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String, files
         | Options::ENABLE_MATH
         | Options::ENABLE_WIKILINKS;
     let (properties, source) = front_matter(markdown);
+    let dates = properties.as_ref().map(|properties| dates::of_front_matter(&properties.source)).unwrap_or_default();
     let events = Parser::new_ext(source, options).into_offset_iter().collect();
     let mut reader = Reader {
         source,
@@ -75,7 +79,7 @@ pub fn import_markdown(markdown: &str, new_id: &mut dyn FnMut() -> String, files
     let previews = std::mem::take(&mut reader.previews);
     let mut document = Document { properties, previews, blocks, ..Document::default() };
     figures::relabel(&mut document);
-    MarkdownImport { document, notes: reader.notes, assets: reader.assets }
+    MarkdownImport { document, notes: reader.notes, assets: reader.assets, dates }
 }
 
 /// The levels of heading a table of contents read from Markdown lists: all of them, as its renderers do.

@@ -143,6 +143,8 @@ struct Word {
     links: Vec<(String, String)>,
     /// Pictures, by the id of their relationship.
     pictures: Vec<(String, Vec<u8>)>,
+    /// What Word records of the file, as what sits inside the root element of that part.
+    core: Option<String>,
 }
 
 /// A file with this body and nothing beside it.
@@ -185,6 +187,11 @@ impl Word {
             ("_rels/.rels".to_owned(), relationships(&relationship("rId1", "officeDocument", "word/document.xml", ""))),
             ("word/document.xml".to_owned(), rooted("w:document", &format!("<w:body>{}</w:body>", self.body))),
         ];
+        if let Some(core) = &self.core {
+            let namespaces = r#"xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance""#;
+            let part = format!("<cp:coreProperties {namespaces}>{core}</cp:coreProperties>");
+            entries.push(("docProps/core.xml".to_owned(), part.into_bytes()));
+        }
         for (index, (kind, inner)) in self.parts.iter().enumerate() {
             let root = match *kind {
                 "commentsExtended" => "w15:commentsEx",
@@ -206,6 +213,32 @@ impl Word {
         let entries: Vec<(&str, &[u8])> =
             entries.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
         zipped(&entries)
+    }
+}
+
+#[test]
+fn a_file_says_when_it_was_made_and_last_changed() {
+    let dated =
+        |name: &str, date: &str| format!(r#"<dcterms:{name} xsi:type="dcterms:W3CDTF">{date}</dcterms:{name}>"#);
+    // 4 May 2019 and 7 June 2021, 08:09:10, both in UTC.
+    let (made, changed) = (Some(1_556_928_000), Some(1_623_053_350));
+    let cases = [
+        (Some(dated("created", "2019-05-04T00:00:00Z") + &dated("modified", "2021-06-07T08:09:10Z")), (made, changed)),
+        (
+            Some("<dc:title>Roof</dc:title>".to_owned() + &dated("modified", "2021-06-07T10:09:10+02:00")),
+            (None, changed),
+        ),
+        (Some(dated("created", "2019-05-04")), (made, None)),
+        // A file that says nothing, or nothing that can be read, is brought in all the same.
+        (Some(dated("created", "last spring")), (None, None)),
+        (Some("<broken".to_owned()), (None, None)),
+        (None, (None, None)),
+    ];
+    for (core, expected) in cases {
+        let file = Word { core: core.clone(), ..bare(&p("Words")) };
+        let read = read(&file);
+        assert_eq!((read.dates.created, read.dates.modified), expected, "{core:?}");
+        assert_eq!(read.document.blocks.len(), 1, "{core:?}");
     }
 }
 

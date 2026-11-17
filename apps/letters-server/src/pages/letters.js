@@ -40,6 +40,14 @@
     if (held) waiting = shown;
     else shown();
   });
+  // A file chosen to import says when it was last changed, which dates the document made of it.
+  document.addEventListener("change", (event) => {
+    const input = event.target;
+    const told = input instanceof HTMLInputElement && input.type === "file" && input.form?.elements.namedItem("modified");
+    if (!(told instanceof HTMLInputElement)) return;
+    const file = input.files?.[0];
+    told.value = file ? String(Math.floor(file.lastModified / 1000)) : "";
+  }, true);
   // Closed, the menu is its button's again. `toggle` does not bubble.
   document.addEventListener("toggle", (event) => {
     const surface = event.target;

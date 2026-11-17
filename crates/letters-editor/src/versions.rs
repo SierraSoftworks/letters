@@ -26,6 +26,18 @@ impl Editor {
         self.model.document_at(revision)
     }
 
+    /// [`Self::mark_version`] with the mark dated `time`, in seconds since 1970, and not now: for an
+    /// import, whose version is as old as the file it was made of.
+    pub fn mark_version_at(
+        &mut self,
+        revision: &Revision,
+        kind: TagKind,
+        name: Option<&str>,
+        time: u64,
+    ) -> Result<(), HistoryError> {
+        self.mark_dated(revision, kind, name, Some(time))
+    }
+
     /// Marks `revision` as where a session, a pause, an import or a merge ended, for a shell that knows
     /// of one, with the name of the file an import came from. Like a name, the mark is something to save
     /// and no edit.
@@ -34,6 +46,16 @@ impl Editor {
     /// gave is lost, and on the step that ends it, since a mark with nothing written after the last one
     /// would list an empty version. A revision nothing was written in needs none either.
     pub fn mark_version(&mut self, revision: &Revision, kind: TagKind, name: Option<&str>) -> Result<(), HistoryError> {
+        self.mark_dated(revision, kind, name, None)
+    }
+
+    fn mark_dated(
+        &mut self,
+        revision: &Revision,
+        kind: TagKind,
+        name: Option<&str>,
+        time: Option<u64>,
+    ) -> Result<(), HistoryError> {
         if self.read_only {
             // A mark is written into the history, which one who only reads leaves as it is.
             return Ok(());
@@ -49,7 +71,10 @@ impl Editor {
         if ended == Some(true) || self.model.tags().iter().any(|tag| &tag.at == revision) {
             return Ok(());
         }
-        self.model.tag(revision, kind, name)
+        match time {
+            Some(time) => self.model.tag_at(revision, kind, name, time),
+            None => self.model.tag(revision, kind, name),
+        }
     }
 
     /// Marks `revision` as a version a person named, or with no name takes its mark off. A mark is part

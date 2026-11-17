@@ -355,7 +355,7 @@ impl Client {
 
     /// Starts a document called `name` in a folder of a space, and hands back its row.
     pub async fn start(&self, space: &str, folder: &str, name: &str) -> Entry {
-        let new = NewDocument { folder: folder.into(), name: Some(name.into()) };
+        let new = NewDocument { folder: folder.into(), name: Some(name.into()), ..NewDocument::default() };
         self.post(&paths::documents(space), &new).await.expect("the document is made")
     }
 }

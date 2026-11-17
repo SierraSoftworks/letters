@@ -37,7 +37,12 @@ async fn a_place_is_plain_visible_names() {
     for path in refused {
         let listing = ben.get::<Listing>(&paths::entries("home", path)).await;
         assert_eq!(listing.expect_err(path).code, Code::Invalid, "{path:?}");
-        let made = ben.post::<Entry>(&paths::documents("home"), &NewDocument { folder: path.into(), name: None }).await;
+        let made = ben
+            .post::<Entry>(
+                &paths::documents("home"),
+                &NewDocument { folder: path.into(), name: None, ..NewDocument::default() },
+            )
+            .await;
         assert_eq!(made.expect_err(path).code, Code::Invalid, "{path:?}");
     }
     let absolute = ben.get::<Listing>(&paths::entries("home", "/")).await.expect("a leading slash is the space itself");
@@ -77,8 +82,12 @@ async fn a_symlink_leads_nowhere() {
     for folder in ["Out", "Out/Private", "Relative"] {
         let listing = ben.get::<Listing>(&paths::entries("home", folder)).await;
         assert!(listing.is_err(), "{folder} lists what is outside the space");
-        let made =
-            ben.post::<Entry>(&paths::documents("home"), &NewDocument { folder: folder.into(), name: None }).await;
+        let made = ben
+            .post::<Entry>(
+                &paths::documents("home"),
+                &NewDocument { folder: folder.into(), name: None, ..NewDocument::default() },
+            )
+            .await;
         assert!(made.is_err(), "{folder} takes a document outside the space");
     }
     assert_eq!(server.scratch.names("outside/Private"), ["Diary.let"]);
