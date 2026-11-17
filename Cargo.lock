@@ -4145,6 +4145,7 @@ dependencies = [
  "letters-trust",
  "letters-ui",
  "serde_json",
+ "sha2",
  "skrifa 0.49.0",
  "tokio",
  "wasm-bindgen",
