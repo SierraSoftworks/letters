@@ -84,7 +84,7 @@ fn the_font_files_a_shell_stored_are_listed_in_the_style_as_an_edit() {
     let font = StyleFont { family: "Lora".into(), weight: 400, italic: false, asset: "assets/a.ttf".into() };
     let edits = window.ui().edits();
     window.keep_fonts(std::slice::from_ref(&font));
-    assert_eq!(window.editor().model().style().fonts(), [font.clone()]);
+    assert_eq!(window.editor().model().style().fonts(), std::slice::from_ref(&font));
     assert!(window.ui().edits() > edits, "the shell can tell there is something to save");
 
     let edits = window.ui().edits();
