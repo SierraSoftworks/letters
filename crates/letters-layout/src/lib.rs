@@ -57,7 +57,7 @@ use crate::leaf::{Extent, Laid, Lay, Lit, Open, Over, Painter, Source, Swap, Tex
 use crate::reveal::{Reveal, Shapes, Shifts};
 
 pub use crate::callout::icon_path;
-pub use crate::engine::{Uncovered, reads};
+pub use crate::engine::{Named, Uncovered, reads};
 pub use crate::flow::{leads, rtl};
 pub use crate::paginate::{Heading, PageBlock, PageLink, Pages, Sheet};
 pub use crate::palette::{Callout, Palette, Scheme, Syntax};
@@ -319,6 +319,14 @@ impl DocLayout {
     /// have them.
     pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
         self.state.get_mut().engine.take_uncovered()
+    }
+
+    /// The faces text has asked for since this was last asked: each family, weight and slant once, in the
+    /// order they were met, whether or not a face of the fonts answers it. Text is looked at as it is laid
+    /// out, as for [`Self::take_uncovered`]. A shell that finds a face for one hands it to
+    /// [`Self::add_fonts`].
+    pub fn take_named(&mut self) -> Vec<Named> {
+        self.state.get_mut().engine.take_named()
     }
 
     /// Hands over the word list of a script that is written without spaces, as [`WordList::data`] gives it.

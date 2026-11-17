@@ -328,3 +328,36 @@ fn a_shaper_tells_what_it_lacks_and_takes_backups() {
     assert!(shaper.take_uncovered().is_empty(), "nothing is lacking now");
     assert!(!shaper.add_fallback_fonts(&backup(CODE_FACE)), "and the face is taken once");
 }
+
+#[test]
+fn a_face_a_style_names_is_told_once_and_sets_its_text_when_it_comes() {
+    // The display family stands for one a writer chose, which the fonts at the start lack.
+    let mut style = Style::default();
+    style.types.get_mut("heading1").unwrap().family = DISPLAY.into();
+    let chosen = Fonts { faces: fonts().faces[3..4].to_vec() };
+    let model = Model::new(
+        doc(vec![heading("h", 1, "Rates"), rich("p", &[("Rates ", &[]), ("change", &[Mark::Bold, Mark::Italic])])]),
+        ReplicaId::from(1),
+    );
+    let mut layout = DocLayout::new(body());
+    layout.update(model.doc(), &style, WIDTH, None);
+    settled(&mut layout);
+
+    let told = layout.take_named();
+    let has = |family: &str, weight: u16, italic: bool| {
+        told.iter().any(|named| named.family == family && named.weight == weight && named.italic == italic)
+    };
+    assert!(has(DISPLAY, 600, false), "the heading's face is told: {told:?}");
+    assert!(has(SANS, 400, false), "and the body's, which a shell knows it has");
+    assert!(told.iter().any(|named| named.family == SANS && named.weight > 400 && named.italic), "and a mark's");
+    assert!(layout.take_named().is_empty(), "each only once");
+
+    let in_chosen = |layout: &DocLayout| {
+        let items = painted(layout, everything());
+        glyph_runs(&items).any(|item| matches!(item, Item::Glyphs { font, .. } if font.data.same(&chosen.faces[0].data)))
+    };
+    assert!(!in_chosen(&layout), "until the face comes the heading is set in what there is");
+    assert!(layout.add_fonts(&chosen), "the face is taken by its family's name");
+    settled(&mut layout);
+    assert!(in_chosen(&layout), "and the heading is set in it");
+}
