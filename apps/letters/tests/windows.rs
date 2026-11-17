@@ -121,7 +121,9 @@ const TO_A_FILE: &str = "Microsoft Print to PDF";
 #[test]
 fn the_pages_asked_for_are_printed() {
     let Some(printer) = Printer::named(TO_A_FILE) else {
-        // A machine may have had it taken off. Then there is nothing here to print on.
+        // A person's machine may have had it taken off, and then there is nothing here to print on. A
+        // runner without it would leave printing unchecked with nobody the wiser.
+        assert!(std::env::var_os("CI").is_none(), "this runner has no printer called {TO_A_FILE:?}");
         eprintln!("not checked: this machine has no printer called {TO_A_FILE:?}");
         return;
     };
