@@ -25,8 +25,10 @@ fn said(command: &mut Command) -> Option<String> {
 /// What the account of the person at this machine calls them: its full name, or else the name they log in
 /// with. This asks the system, so call it off the main thread.
 pub fn account() -> Option<String> {
-    let login = env::var("USER").or_else(|_| env::var("LOGNAME")).ok().and_then(|login| proper(&login));
+    let names = if cfg!(windows) { ["USERNAME", "USER"] } else { ["USER", "LOGNAME"] };
+    let login = names.into_iter().find_map(|name| env::var(name).ok().and_then(|login| proper(&login)));
     let named = match (cfg!(target_os = "macos"), &login) {
+        _ if cfg!(windows) => letters_frame::account_name().and_then(|name| proper(&name)),
         (true, _) => said(Command::new("id").arg("-F")).and_then(|name| proper(&name)),
         (false, Some(login)) => said(Command::new("getent").args(["passwd", login])).and_then(|line| full_name(&line)),
         (false, None) => None,

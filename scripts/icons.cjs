@@ -33,8 +33,9 @@ function ico(pngs, sizes) {
   let at = head.length;
   sizes.forEach((size, i) => {
     const entry = 6 + 16 * i;
-    head.writeUInt8(size, entry);
-    head.writeUInt8(size, entry + 1);
+    // A byte each, where 0 stands for 256.
+    head.writeUInt8(size & 255, entry);
+    head.writeUInt8(size & 255, entry + 1);
     head.writeUInt16LE(1, entry + 4);
     head.writeUInt16LE(32, entry + 6);
     head.writeUInt32LE(pngs[size].length, entry + 8);
@@ -71,4 +72,6 @@ function ico(pngs, sizes) {
   writeFileSync(join(ICONS, "letters.icns"), icns(sets.app));
   writeFileSync(join(ICONS, "document.icns"), icns(sets.file));
   writeFileSync(join(ICONS, "favicon.ico"), ico(sets.app, [16, 32, 48]));
+  // What Windows shows for the program's file, at every size it asks for.
+  writeFileSync(join(ICONS, "letters.ico"), ico(sets.app, [16, 32, 48, 64, 128, 256]));
 })();

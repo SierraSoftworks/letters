@@ -61,7 +61,15 @@ muda.workspace = true
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus.workspace = true
 
+# Draws the pages of a PDF for a printer, which Windows is sent as pictures. In Rust alone.
+[target.'cfg(windows)'.dependencies]
+hayro.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
+
 [dev-dependencies]
+letters-frame = { workspace = true, features = ["probe"] }
 letters-server = { path = "../letters-server" }
 axum.workspace = true
 hayro.workspace = true

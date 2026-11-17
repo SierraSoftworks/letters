@@ -102,8 +102,8 @@ the first time.
     System Settings > Privacy & Security; or
   - run `xattr -dr com.apple.quarantine /Applications/Letters.app` in Terminal, which also helps when macOS
     calls the app damaged.
-- **Windows.** Run `letters-x86_64-pc-windows-msvc.exe`. When SmartScreen stops it, press More info, then
-  Run anyway.
+- **Windows.** Run `letters-x86_64-pc-windows-msvc.exe` from a folder of your own, where it can replace
+  itself with newer releases. When SmartScreen stops it, press More info, then Run anyway.
 - **Linux.** `chmod +x letters-x86_64-unknown-linux-gnu`, put it on your `PATH` as `letters`, and run
   `./scripts/install-desktop.sh` from this repository for the desktop entry and icons.
 

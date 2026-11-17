@@ -1,7 +1,9 @@
 //! Printing: a document's PDF handed to the system's print dialog.
 //!
 //! macOS shows its print sheet on the window. Other Unix desktops print through the desktop portal, which
-//! shows the dialog of the person's desktop and takes the PDF as an open file. Windows is not built yet.
+//! shows the dialog of the person's desktop and takes the PDF as an open file. Windows prints what a
+//! program draws, so each page of the PDF is drawn as a picture and put on the printer the person chose
+//! in the system's print dialog.
 
 use winit::window::Window;
 
@@ -23,11 +25,113 @@ mod system {
 }
 
 #[cfg(windows)]
+pub use system::print_on;
+
+#[cfg(windows)]
 mod system {
+    use std::ops::RangeInclusive;
+    use std::path::Path;
+    use std::thread;
+
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::hayro_syntax::Pdf;
+    use hayro::hayro_syntax::page::Page;
+    use hayro::vello_cpu::color::palette::css;
+    use hayro::{PixmapSettings, RenderCache, RenderSettings};
+    use letters_frame::printer::{self, Paper, Printer, Sheet};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
-    pub fn print(_: Vec<u8>, _: String, _: &Window, done: impl FnOnce(Result<(), String>)) {
-        done(Err("Printing is not built for Windows yet. Export a PDF from Print view and print that.".into()));
+    /// The finest a page is drawn, in dots to the inch. A printer with more is sent this and fills in:
+    /// text stays sharp to the eye, and a page stays tens of megabytes and not hundreds.
+    const FINEST: f32 = 300.0;
+
+    pub fn print(pdf: Vec<u8>, title: String, window: &Window, done: impl FnOnce(Result<(), String>) + Send + 'static) {
+        let owner = match window.window_handle().map(|handle| handle.as_raw()) {
+            Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
+            _ => 0,
+        };
+        // The dialog is waited for, and the pages are drawn, which the window's own thread cannot do.
+        thread::spawn(move || done(through_dialog(pdf, &title, owner)));
+    }
+
+    /// Shows the print dialog, then prints the pages the person chose there on the printer they chose.
+    fn through_dialog(pdf: Vec<u8>, title: &str, owner: isize) -> Result<(), String> {
+        let pdf = read(pdf)?;
+        let count = u32::try_from(pdf.pages().len()).unwrap_or(u32::MAX);
+        let chosen = printer::choose(owner, count).map_err(|()| "The print dialog could not be shown.".to_owned())?;
+        // A dialog that was closed without printing is no failure.
+        let Some(chosen) = chosen else { return Ok(()) };
+        print_pages(chosen.printer, &pdf, title, chosen.pages, None)
+    }
+
+    fn read(pdf: Vec<u8>) -> Result<Pdf, String> {
+        Pdf::new(pdf).map_err(|error| {
+            eprintln!("letters: could not read what is printed: {error:?}");
+            "The document could not be made ready to print.".to_owned()
+        })
+    }
+
+    /// Prints the pages `pages` of `pdf`, counted from 1, on `printer` as a job called `title`. `into`
+    /// names the file a printer that writes one is to write, which the print dialog otherwise asks for.
+    pub fn print_on(
+        printer: Printer,
+        pdf: Vec<u8>,
+        title: &str,
+        pages: RangeInclusive<u32>,
+        into: Option<&Path>,
+    ) -> Result<(), String> {
+        print_pages(printer, &read(pdf)?, title, pages, into)
+    }
+
+    fn print_pages(
+        printer: Printer,
+        pdf: &Pdf,
+        title: &str,
+        pages: RangeInclusive<u32>,
+        into: Option<&Path>,
+    ) -> Result<(), String> {
+        let paper = printer.paper();
+        let numbered = (1u32..).zip(pdf.pages().iter());
+        let mut wanted = numbered.filter(|(number, _)| pages.contains(number)).map(|(_, page)| page);
+        let sent = printer.print(title, into, || wanted.next().map(|page| sheet(page, paper)));
+        sent.then_some(()).ok_or_else(|| "The printer did not take the document.".to_owned())
+    }
+
+    /// One page as the picture the printer is sent: at its own size, or smaller where the paper is, and
+    /// white where the page draws nothing.
+    fn sheet(page: &Page<'_>, paper: Paper) -> Sheet {
+        // A page is measured in points, 72 to the inch.
+        let (width, height) = page.render_dimensions();
+        let (across, down) = (width * paper.dots.0 as f32 / 72.0, height * paper.dots.1 as f32 / 72.0);
+        let fit = (paper.width as f32 / across).min(paper.height as f32 / down).min(1.0);
+        let (across, down) = (across * fit, down * fit);
+        let coarser = (FINEST / paper.dots.0.max(paper.dots.1) as f32).min(1.0);
+        let scale = PixmapSettings {
+            x_scale: across * coarser / width,
+            y_scale: down * coarser / height,
+            bg_color: css::WHITE,
+        };
+        let drawn = hayro::render(
+            page,
+            &RenderCache::new(),
+            &InterpreterSettings::default(),
+            &RenderSettings::default(),
+            &scale,
+        );
+        let (wide, tall) = (usize::from(drawn.width()), usize::from(drawn.height()));
+        // The system keeps a picture from its bottom row up, and blue before red.
+        let mut pixels = Vec::with_capacity(wide * tall * 4);
+        for row in drawn.data().chunks_exact(wide.max(1)).rev() {
+            pixels.extend(row.iter().flat_map(|pixel| [pixel.b, pixel.g, pixel.r, 255]));
+        }
+        Sheet {
+            width: wide as u32,
+            height: tall as u32,
+            pixels,
+            across: across.round() as u32,
+            down: down.round() as u32,
+        }
     }
 }
 

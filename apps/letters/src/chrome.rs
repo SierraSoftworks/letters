@@ -2,7 +2,8 @@
 //!
 //! On macOS the system keeps its traffic lights, so there is nothing to ask. On Linux the window buttons are
 //! the bar's own, and they follow the desktop's `button-layout` setting: which buttons, in what order, on
-//! which side. Whether things may move is the desktop's to say too.
+//! which side. On Windows they are the bar's own too, always the three at its end, and the system keeps
+//! the window's border and shadow. Whether things may move is the desktop's to say too.
 
 use letters_frame::Lights;
 use letters_ui::{Chrome, Frame, WindowButton};
@@ -22,6 +23,8 @@ pub enum Host {
     Mac,
     /// Wayland and X11, where Letters draws the frame and the window's buttons.
     Linux,
+    /// Windows, where the system keeps the border and the shadow and Letters draws the bar and its buttons.
+    Windows,
     /// Anywhere else the system frames and titles the window as it does any other.
     Other,
 }
@@ -30,6 +33,8 @@ impl Host {
     /// The desktop this build runs on.
     pub const HERE: Self = if cfg!(target_os = "macos") {
         Self::Mac
+    } else if cfg!(windows) {
+        Self::Windows
     } else if cfg!(all(unix, not(target_os = "android"), not(target_os = "ios"))) {
         Self::Linux
     } else {
@@ -64,13 +69,16 @@ impl Host {
                 let bar_height = lights.map(|lights| 2.0 * lights.centre).or(bar);
                 Chrome { frame: Frame::Unified, inset_start, bar_height, maximized, ..Chrome::default() }
             }
-            Self::Linux => Chrome {
-                buttons: buttons.order.iter().map(|button| button.shown()).collect(),
-                buttons_at_start: buttons.at_start,
-                frame: if maximized || full_screen { Frame::Filled } else { Frame::Floating },
-                maximized,
-                ..Chrome::default()
-            },
+            Self::Linux | Self::Windows => {
+                let floating = if self == Self::Windows { Frame::Bordered } else { Frame::Floating };
+                Chrome {
+                    buttons: buttons.order.iter().map(|button| button.shown()).collect(),
+                    buttons_at_start: buttons.at_start,
+                    frame: if maximized || full_screen { Frame::Filled } else { floating },
+                    maximized,
+                    ..Chrome::default()
+                }
+            }
         }
     }
 }
@@ -158,7 +166,10 @@ impl Buttons {
 pub fn reduced_motion() -> Option<bool> {
     // The setting every desktop is meant to share, then the one GNOME has always had.
     let asked = portal::number("org.freedesktop.appearance", "reduced-motion").map(|reduced| reduced == 1);
-    asked.or_else(|| portal::flag("org.gnome.desktop.interface", "enable-animations").map(|animated| !animated))
+    let asked =
+        asked.or_else(|| portal::flag("org.gnome.desktop.interface", "enable-animations").map(|animated| !animated));
+    // Windows has one switch, "Animation effects".
+    asked.or_else(|| letters_frame::animations().map(|animated| !animated))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

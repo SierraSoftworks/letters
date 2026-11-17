@@ -1,5 +1,9 @@
 //! The Letters desktop app.
 
+// Windows opens a console beside a program that asks for one, and the app asks for none. The commands
+// that print write to the console they were started from (see `attach_console`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 
 use letters::cli::{self, Command, Mode};
@@ -8,6 +12,9 @@ use letters::update::{self, Resumed};
 
 fn main() -> ExitCode {
     let launch = Launch::start();
+    // Without a console of its own, `letters --version` and the like say nothing unless they take the one
+    // they were typed into. Started from anywhere else there is none, and nothing to say it to.
+    let _ = letters_frame::attach_console();
     // A file in a folder synced on demand is downloaded as it is read, also when Letters was not started
     // from Finder. Without this macOS refuses the read (EDEADLK).
     if !letters_frame::fetch_cloud_files() {

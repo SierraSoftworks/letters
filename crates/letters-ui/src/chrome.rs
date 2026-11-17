@@ -38,6 +38,9 @@ pub enum Frame {
     Unified,
     /// Letters draws the frame of a window that floats: a 1 px border, with a grip inside it to resize by.
     Floating,
+    /// The system draws the border and the shadow of a window that floats, as Windows does, and no title
+    /// bar: the bar is the title bar, and the grip to resize by is inside the border.
+    Bordered,
     /// Letters draws the frame of a window that fills its place, maximised, tiled or full screen: no border
     /// and no grip.
     Filled,
@@ -86,7 +89,7 @@ impl Chrome {
 
     /// The edge a point of a floating window's grip resizes from.
     pub(crate) fn edge(&self, at: Point, window: Size) -> Option<Edge> {
-        if self.frame != Frame::Floating {
+        if !matches!(self.frame, Frame::Floating | Frame::Bordered) {
             return None;
         }
         let near =
@@ -136,7 +139,6 @@ mod tests {
 
     #[test]
     fn a_floating_window_is_resized_from_just_inside_its_edge() {
-        let chrome = Chrome { frame: Frame::Floating, ..Chrome::default() };
         let cases = [
             ((400.0, 2.0), Some(Edge::North)),
             ((400.0, 597.0), Some(Edge::South)),
@@ -151,8 +153,20 @@ mod tests {
             ((400.0, 300.0), None),
             ((400.0, 8.0), None),
         ];
-        for ((x, y), expected) in cases {
-            assert_eq!(chrome.edge(Point { x, y }, WINDOW), expected, "at {x}, {y}");
+        for frame in [Frame::Floating, Frame::Bordered] {
+            let chrome = Chrome { frame, ..Chrome::default() };
+            for ((x, y), expected) in cases {
+                assert_eq!(chrome.edge(Point { x, y }, WINDOW), expected, "{frame:?} at {x}, {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn letters_draws_a_border_only_where_the_system_draws_none() {
+        let border = |frame| Chrome { frame, ..Chrome::default() }.border();
+        assert!(border(Frame::Floating) > 0.0);
+        for frame in [Frame::System, Frame::Unified, Frame::Bordered, Frame::Filled] {
+            assert_eq!(border(frame), 0.0, "{frame:?}");
         }
     }
 

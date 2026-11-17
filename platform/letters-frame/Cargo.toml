@@ -15,6 +15,10 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
 
+[features]
+# What the app's tests look at its window with on Windows. The app itself calls none of it.
+probe = []
+
 [dependencies]
 raw-window-handle.workspace = true
 memmap2.workspace = true
@@ -29,3 +33,6 @@ bytemuck.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
