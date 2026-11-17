@@ -993,7 +993,7 @@ impl Model {
         if self.is_latest() {
             return Change::default();
         }
-        self.loro().checkout_to_latest();
+        newest(self.loro());
         self.drain()
     }
 
@@ -1017,7 +1017,7 @@ impl Model {
             // The history held this revision a moment ago.
             let _ = history.loro.checkout(&shown);
         } else {
-            history.loro.checkout_to_latest();
+            newest(&history.loro);
         }
         self.queue().clear();
         Ok(conflict::told(found?))
@@ -1058,7 +1058,7 @@ impl Model {
         }
         let mut change = Change::default();
         if !detached {
-            self.loro().checkout_to_latest();
+            newest(self.loro());
             // Coming back from the revision shown before tells what the settling did to the document.
             if written {
                 change = self.drain();
@@ -1077,7 +1077,7 @@ impl Model {
         let there = match revision {
             Some(revision) => loro.checkout(&revision.0).map_err(|_| HistoryError::UnknownRevision),
             None => {
-                loro.checkout_to_latest();
+                newest(loro);
                 Ok(())
             }
         };
@@ -1091,7 +1091,7 @@ impl Model {
         match shown {
             // The history held this revision a moment ago.
             Some(shown) => drop(self.loro().checkout(&shown)),
-            None => self.loro().checkout_to_latest(),
+            None => newest(self.loro()),
         }
         self.queue().clear();
     }
@@ -1185,7 +1185,7 @@ impl Model {
         loro.frontiers_to_vv(&tag.at.0).ok_or(HistoryError::UnknownRevision)?;
         // The marks are read and written where the history is newest.
         let shown = loro.is_detached().then(|| loro.state_frontiers());
-        loro.checkout_to_latest();
+        newest(loro);
         versions::mark(loro, &tag);
         self.commit();
         self.show(shown);
@@ -1197,7 +1197,7 @@ impl Model {
     pub fn untag(&mut self, revision: &Revision) {
         let loro = self.loro();
         let shown = loro.is_detached().then(|| loro.state_frontiers());
-        loro.checkout_to_latest();
+        newest(loro);
         if versions::unmark(loro, revision) {
             self.commit();
         }
@@ -1826,6 +1826,12 @@ fn replacement(cut: &[TextDelta], put: &[TextDelta]) -> Option<Delta> {
 
 pub(crate) fn unreadable(error: impl fmt::Display) -> HistoryError {
     HistoryError::Unreadable(error.to_string())
+}
+
+/// Shows the newest revision again. Loro refuses only where the state cannot hold what the history says,
+/// which is a history `Model::check` refuses, and a failure went the same way before Loro reported it.
+fn newest(loro: &LoroDoc) {
+    loro.try_checkout_to_latest().expect("a history can show its newest revision");
 }
 
 fn bad(block: &BlockId, offset: usize) -> OpError {

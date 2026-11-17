@@ -37,7 +37,7 @@ unicode-segmentation = "1"
 # Finds text by a pattern, in time that grows only with the text. Pure Rust, and already under the maths engine.
 regex = "1"
 # The CRDT behind letters-model. No other crate may name it.
-loro = { version = "1.17", default-features = false }
+loro = { version = "1.18", default-features = false }
 # The checksum Loro seals a history with. Only the fuzz targets name it, to seal the histories they try.
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 jsonschema = { version = "0.61", default-features = false }
