@@ -960,6 +960,7 @@ fn keeps_text_that_looks_like_markdown_as_text() {
         "a | b\n- | -",
         "Title\n===",
         "  spaced out  ",
+        "\u{b}feeds and tabs at the edges \u{c}",
         "trailing backslash\\",
         "[^1]: not a footnote",
         "~~~",

@@ -738,8 +738,9 @@ impl<'a> Inline<'a> {
                     out.push_str(&format!("&#{};", u32::from(c)));
                     continue;
                 }
-                // Markdown trims a line, so the spaces at its ends are written as references.
-                ' ' | '\t' | '\r' if c == '\r' || before.is_none() || after.is_none() => {
+                // Markdown trims a line, so the spaces at its ends are written as references. A heading
+                // loses a vertical tab and a form feed there too.
+                ' ' | '\t' | '\r' | '\u{b}' | '\u{c}' if c == '\r' || before.is_none() || after.is_none() => {
                     out.push_str(&format!("&#{};", u32::from(c)));
                     continue;
                 }
