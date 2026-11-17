@@ -56,6 +56,8 @@ pub enum Noting {
     Answer,
     /// Resolves the note that is open.
     Resolve,
+    /// Resolves a note from its card beside the page.
+    ResolveNote(String),
     /// Puts the block of the conflict that is open back on the page, as the version that still has it.
     PutBack,
     /// Puts the note that is open away.
@@ -89,6 +91,9 @@ pub(crate) struct Margin {
     left: Option<String>,
     /// The markers beside the blocks that have open notes, in the order of the document.
     marks: Vec<Marker>,
+    /// Where the open comments and import notes are among the notes, in the order of the page, as their
+    /// cards stand beside it. Those whose text is gone come first.
+    beside: Vec<usize>,
     /// The block whose marker the pointer rests on.
     pub over: Option<BlockId>,
     /// The time that notes are told against, as RFC 3339. Empty when the shell has no clock.
@@ -150,9 +155,10 @@ impl Margin {
 
     /// The field that is open, to write in: the comment's, or the reply's to the note that is read. With
     /// it comes how wide the row is that it shares with the button that sends it.
-    pub fn written(&mut self) -> Option<(&mut Written, f32)> {
+    /// A reply on a card beside the page has the row of the card, `card` wide.
+    pub fn written(&mut self, card: Option<f32>) -> Option<(&mut Written, f32)> {
         let draft = self.draft.as_mut().map(|(_, draft)| (draft, WIDTH));
-        draft.or(self.thread.as_mut().map(|(_, reply)| (reply, crate::threads::WIDTH)))
+        draft.or(self.thread.as_mut().map(|(_, reply)| (reply, card.unwrap_or(crate::threads::WIDTH))))
     }
 
     /// The comment being written, as far as it is.
@@ -228,21 +234,67 @@ impl Margin {
             visit(block);
             block.body.blocks().iter().for_each(|part| within(part, visit));
         }
-        let mut about: HashMap<&BlockId, Vec<(&Note, Kind)>> = HashMap::new();
-        for (note, kind) in self.open() {
-            about.entry(&note.anchor.block).or_default().push((note, kind));
+        // Each open note with where it is among the notes.
+        let open = self.notes.notes.iter().enumerate().filter(|(_, note)| !note.resolved);
+        let open: Vec<(usize, &Note, Kind)> = open.filter_map(|(at, note)| Some((at, note, Kind::of(note)?))).collect();
+        let mut about: HashMap<&BlockId, Vec<(usize, &Note, Kind)>> = HashMap::new();
+        for (at, note, kind) in &open {
+            about.entry(&note.anchor.block).or_default().push((*at, note, *kind));
         }
-        let mut marks = Vec::new();
+        let (mut marks, mut beside) = (Vec::new(), Vec::new());
         for top in doc.blocks.iter().filter(|_| !about.is_empty()) {
             let mut marker: Option<Marker> = None;
             within(top, &mut |block| {
-                for (note, kind) in about.get(&block.id).into_iter().flatten() {
+                let Some(notes) = about.get(&block.id) else { return };
+                for (_, note, kind) in notes {
                     marker.get_or_insert_with(|| Marker::beside(top, *kind)).add(note, *kind);
                 }
+                // Down a block the cards go as their passages do.
+                let mut cards: Vec<&(usize, &Note, Kind)> = notes.iter().filter(|(.., kind)| kind.carded()).collect();
+                cards.sort_by_key(|(_, note, _)| note.anchor.range.as_ref().map_or(0, |range| range.start));
+                beside.extend(cards.into_iter().map(|(at, ..)| *at));
             });
             marks.extend(marker);
         }
-        self.marks = marks;
+        let mut placed = vec![false; self.notes.notes.len()];
+        beside.iter().for_each(|at| placed[*at] = true);
+        let lost = open.iter().filter(|(at, _, kind)| kind.carded() && !placed[*at]);
+        let mut all: Vec<usize> = lost.map(|(at, ..)| *at).collect();
+        all.append(&mut beside);
+        (self.marks, self.beside) = (marks, all);
+    }
+
+    /// The open comments and import notes, in the order their cards stand beside the page.
+    pub fn cards(&self) -> impl Iterator<Item = &Note> + '_ {
+        let carded = |note: &&Note| self.carded(note);
+        self.beside.iter().filter_map(|at| self.notes.notes.get(*at)).filter(carded)
+    }
+
+    /// Whether a note is one that has a card: an open comment or import note.
+    pub fn carded(&self, note: &Note) -> bool {
+        !note.resolved && Kind::of(note).is_some_and(Kind::carded)
+    }
+
+    /// Whether the card that is open was asked for or is written on, and not just come by with the caret.
+    pub fn holds(&self) -> bool {
+        let written = self.thread.as_ref().is_some_and(|(_, reply)| !reply.is_blank());
+        self.reading().is_some() && (!self.followed || written)
+    }
+
+    /// Takes the card the caret opened as one the person turned to, since they pressed in it.
+    pub fn turn(&mut self) {
+        self.followed = false;
+    }
+
+    /// Leaves the card that is open, as a press on the page or Escape does. One a reply is written on
+    /// stays, and so does one the caret is in the passage of. Returns whether a card was left.
+    pub fn leave(&mut self, escaped: bool) -> bool {
+        let leaves = |(_, reply): &(String, Written)| reply.is_blank() || escaped;
+        if (self.followed && !escaped) || !self.thread.as_ref().is_some_and(leaves) {
+            return false;
+        }
+        self.thread = None;
+        true
     }
 
     /// The note that is open under its passage, and the reply written to it so far. A conflict whose
@@ -428,6 +480,18 @@ impl Margin {
         self.thread = None;
         self.notes.notes.iter_mut().filter(|note| note.id == id).for_each(|note| note.resolved = true);
         true
+    }
+
+    /// Resolves a note from its card. Returns whether it did.
+    pub fn resolve_note(&mut self, id: &str) -> bool {
+        if self.refusal().is_some() {
+            return false;
+        }
+        if self.thread.as_ref().is_some_and(|(open, _)| open == id) {
+            self.thread = None;
+        }
+        let open = self.notes.notes.iter_mut().find(|note| note.id == id && !note.resolved);
+        open.map(|note| note.resolved = true).is_some()
     }
 
     /// Resolves every open import note. Returns whether there were any.

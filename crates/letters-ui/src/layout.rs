@@ -253,7 +253,7 @@ impl Layout<'_> {
         let growth: f32 = children.iter().map(|&child| tree.nodes[child].el.style.grow).sum();
         let spare = main - used - gaps;
 
-        let mut scrolled = 0.0;
+        let mut scrolled = style.lift;
         if style.scroll {
             let offset = self.scroll.entry(tree.nodes[i].id).or_insert(0.0);
             *offset = offset.clamp(0.0, (tree.nodes[i].content_height - inner.height).max(0.0));

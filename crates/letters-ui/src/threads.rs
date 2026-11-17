@@ -5,6 +5,7 @@
 //! tone on the same marker, opens in place and is listed in the panel. The page is drawn on a canvas, so
 //! the markers are drawn there too and the window asks this module where they stand.
 
+use std::collections::HashMap;
 use std::iter;
 use std::rc::Rc;
 
@@ -15,7 +16,7 @@ use letters_model::{
 };
 use letters_render::{DisplayList, Item, Point, Rect, Size};
 
-use crate::color::resolve;
+use crate::color::{blend, resolve};
 use crate::element::{Element, Paint, Pointer};
 use crate::icon::{self, Icon};
 use crate::notes::{Margin, Noting};
@@ -76,6 +77,11 @@ impl Kind {
         }
     }
 
+    /// Whether notes of the kind have cards beside the page. A conflict shows in the page instead.
+    pub(crate) fn carded(self) -> bool {
+        self != Self::Conflict
+    }
+
     fn sign(self) -> Icon {
         match self {
             Self::Comment => icon::MESSAGE_SQUARE,
@@ -121,7 +127,7 @@ pub(crate) struct Marker {
     /// start, since text without words cannot be asked whether it shows.
     pub first: Option<(BlockId, usize)>,
     /// The most pressing kind among the notes, which the marker shows.
-    kind: Kind,
+    pub kind: Kind,
     /// Whether the notes are of more than one kind.
     mixed: bool,
     /// Every note and every reply to one counts.
@@ -232,6 +238,13 @@ pub(crate) struct Spoken {
     links: Vec<(Rect, String)>,
 }
 
+impl Spoken {
+    /// How tall what is said stands.
+    pub fn tall(&self) -> f32 {
+        self.size.height
+    }
+}
+
 impl Paint for Spoken {
     fn paint(&self, rect: Rect, _visible: Rect, _scheme: Scheme, out: &mut DisplayList) {
         let first = out.items.len();
@@ -253,12 +266,20 @@ pub(crate) struct Said {
     /// What was last set: the note, how many replies it had, how wide and in which colours.
     of: Option<(String, usize, f32, Palette)>,
     spoken: Vec<Rc<Spoken>>,
+    /// What the cards beside the page say, by note, each with how it was set.
+    cards: HashMap<String, (Set, Voices)>,
 }
+
+/// How what a card says was set: how many replies the note had, how wide and in which colours.
+type Set = (usize, f32, Palette);
+/// What a note and each reply to it say, as they were set.
+pub(crate) type Voices = Rc<[Rc<Spoken>]>;
 
 impl Said {
     /// Has what is said set again when it is next asked for, as when more fonts have arrived.
     pub fn again(&mut self) {
         self.of = None;
+        self.cards.clear();
     }
 
     /// Takes faces of the system that back the fonts up. Returns whether a character that was shown
@@ -282,7 +303,9 @@ impl Said {
         }
         let Some(layout) = &mut self.layout else { return false };
         layout.add_word_list(list, data);
-        self.of.take().is_some()
+        let carded = !self.cards.is_empty();
+        self.cards.clear();
+        self.of.take().is_some() || carded
     }
 
     /// The scripts that notes set without their word list since this was last asked.
@@ -316,6 +339,27 @@ impl Said {
             (self.spoken, self.of) = (spoken, Some(of));
         }
         &self.spoken
+    }
+
+    /// What a note and each reply to it say on its card beside the page, set `width` wide. Every card
+    /// shows at once, so each note's is kept until the note changes.
+    pub fn card(&mut self, note: &Note, width: f32, palette: Palette) -> Voices {
+        let set = (note.replies.len(), width, palette);
+        if let Some((_, spoken)) = self.cards.get(&note.id).filter(|(kept, _)| *kept == set) {
+            return spoken.clone();
+        }
+        let layout = self.layout(palette);
+        let said = iter::once(&note.content).chain(note.replies.iter().map(|reply| &reply.content));
+        let spoken: Voices = said.map(|runs| Rc::new(spoken(layout, runs, width))).collect();
+        self.cards.insert(note.id.clone(), (set, spoken.clone()));
+        spoken
+    }
+
+    /// Forgets what the cards of notes that are no longer `open` said.
+    pub fn keep(&mut self, open: usize, is_open: impl Fn(&str) -> bool) {
+        if self.cards.len() > open {
+            self.cards.retain(|note, _| is_open(note));
+        }
     }
 }
 
@@ -393,12 +437,9 @@ fn send(asked: Noting) -> Message {
     Message::Note(asked)
 }
 
-/// The face of who speaks: the first letters of their name, or the sign of an import for what it noted.
-pub(crate) fn face(name: &str, import: bool) -> Element<Message> {
-    match import {
-        true => round(Element::icon(icon::FILE_INPUT, SIGN)),
-        false => lettered(&initials(name)),
-    }
+/// The face of who speaks: the first letters of their name.
+pub(crate) fn face(name: &str) -> Element<Message> {
+    lettered(&initials(name))
 }
 
 /// A face that says a few letters: the first of someone's name, or how many more people there are.
@@ -419,28 +460,33 @@ fn round(inside: Element<Message>) -> Element<Message> {
         .child(inside)
 }
 
-/// One comment or reply in a note: who said it and when, over what was said. A press on a link in it asks
-/// for the link to be opened.
-fn voice(index: usize, (who, when): (&str, &str), said: &Rc<Spoken>, import: bool, now: &str) -> Element<Message> {
-    let small = TextStyle::control().size(tokens::TEXT_SM);
-    let (name, ago) = (named(who), opening::ago(now, when));
+/// What was said, as it was set. A press on a link in it asks for the link to be opened, and one
+/// anywhere else for `otherwise`.
+pub(crate) fn words(said: &Rc<Spoken>, otherwise: Option<Message>) -> Element<Message> {
     let links = said.links.clone();
     let follow = move |event: Pointer| match event {
         Pointer::Down { at, .. } => {
             let link = links.iter().find(|(line, _)| line.contains(at));
-            link.map(|(_, href)| Message::Safe(Safely::Follow(href.clone())))
+            link.map(|(_, href)| Message::Safe(Safely::Follow(href.clone()))).or(otherwise.clone())
         }
         _ => None,
     };
     let paint: Rc<dyn Paint> = said.clone();
-    let words = Element::canvas(paint)
+    Element::canvas(paint)
         .width(said.size.width)
         .height(said.size.height)
         .role(Role::Paragraph)
         .label(said.plain.as_str())
         .on_pointer(follow)
         // The reply keeps the keyboard while what was said is read and its links are pressed.
-        .passive();
+        .passive()
+}
+
+/// One comment or reply in a note: who said it and when, over what was said.
+fn voice(index: usize, (who, when): (&str, &str), said: &Rc<Spoken>, now: &str) -> Element<Message> {
+    let small = TextStyle::control().size(tokens::TEXT_SM);
+    let (name, ago) = (named(who), opening::ago(now, when));
+    let words = words(said, None);
     let by = Element::row()
         .align(Align::Center)
         .gap(tokens::SPACE_SM)
@@ -453,8 +499,27 @@ fn voice(index: usize, (who, when): (&str, &str), said: &Rc<Spoken>, import: boo
         .role(Role::Comment)
         .label(name)
         .description(ago)
-        .child(face(name, import))
+        .child(face(name))
         .child(Element::column().gap(tokens::SPACE_2XS).width(SAID).child(by).child(words))
+}
+
+/// The amber of what an import left: the ground it is written on, and the line round that.
+pub(crate) fn amber() -> (Ink, Ink) {
+    (blend(tokens::SURFACE, tokens::WARN, 0.1), blend(tokens::SURFACE, tokens::WARN, 0.35))
+}
+
+/// What an import noted, in a note that is open: it is no one's, so it names no one, on amber.
+fn imported(said: &Rc<Spoken>) -> Element<Message> {
+    let (ground, line) = amber();
+    Element::column()
+        .key(("said", 0))
+        .padding(Edges::all(tokens::SPACE_SM))
+        .bg(ground)
+        .border(Edges::all(1.0), line)
+        .radius(tokens::RADIUS_CONTROL)
+        .role(Role::Comment)
+        .label("Import note")
+        .child(words(said, None))
 }
 
 /// A note that is open, to hang under its passage: what was said, by whom and when, with Resolve at its
@@ -497,7 +562,10 @@ pub(crate) fn thread(
         let by = iter::once((note.author.as_str(), note.created.as_str()));
         let by = by.chain(note.replies.iter().map(|reply| (reply.author.as_str(), reply.created.as_str())));
         let voices = by.zip(said).enumerate();
-        let voices = voices.map(|(index, (by, said))| voice(index, by, said, kind == Kind::Import && index == 0, now));
+        let voices = voices.map(|(index, (by, said))| match kind == Kind::Import && index == 0 {
+            true => imported(said),
+            false => voice(index, by, said, now),
+        });
         let mut voices = Element::column().gap(tokens::SPACE_MD).children(voices);
         // A long exchange scrolls, so that its reply stays within reach.
         let tall: f32 = said.iter().map(|said| said.size.height + FACE + tokens::SPACE_MD).sum();
@@ -511,7 +579,11 @@ pub(crate) fn thread(
             .padding(Edges::top(tokens::SPACE_MD))
             .border(Edges::top(1.0), tokens::LINE);
         let under = match refused {
-            Some(why) => under.child(Element::paragraph(why, small).fg(tokens::FG_MUTED).grow(1.0).role(Role::Status)),
+            // An import note is no one's to answer.
+            _ if kind == Kind::Import => None,
+            Some(why) => {
+                Some(under.child(Element::paragraph(why, small).fg(tokens::FG_MUTED).grow(1.0).role(Role::Status)))
+            }
             None => {
                 let post = Button::icon_only(icon::SEND, "Send")
                     .primary()
@@ -520,10 +592,10 @@ pub(crate) fn thread(
                     .on_press(send(Noting::Answer));
                 // A note the caret opened leaves the keyboard with the page, until its reply is pressed.
                 let field = field.key("reply");
-                under.child(if follows { field } else { field.takes_focus() }).child(post)
+                Some(under.child(if follows { field } else { field.takes_focus() }).child(post))
             }
         };
-        all = all.child(top).child(voices).child(under);
+        all = all.child(top).child(voices).children(under);
     }
     let thread = Popover::new(all)
         .label(title)
@@ -558,7 +630,7 @@ fn kept(version: &Version, now: &str) -> Element<Message> {
         .gap(tokens::SPACE_SM)
         .padding(Edges::top(tokens::SPACE_MD))
         .border(Edges::top(1.0), tokens::LINE)
-        .child(face(name, false))
+        .child(face(name))
         .child(told)
 }
 

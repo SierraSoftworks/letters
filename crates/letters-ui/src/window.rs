@@ -27,6 +27,7 @@ use letters_spell::Dictionary;
 use crate::browsing::{Browsed, Browser, Browsing, Stored};
 use crate::callouts::{self, Calling, Callouts};
 use crate::captions::{self, Altering, Captions};
+use crate::cards::{self, Card, Cards, Fit};
 use crate::chrome::Chrome;
 use crate::code_copy::{self, CodeCopy};
 use crate::color::{fade, resolve, same};
@@ -1391,6 +1392,8 @@ pub struct EditorApp {
     review: Review,
     /// What the note that is open says, set to be drawn.
     said: Said,
+    /// The cards of the notes beside the page.
+    cards: Cards,
     /// What the bar says of a write that was just done, as where the document was first saved, and since
     /// when, once a frame has said so.
     note: Option<(String, Option<u64>)>,
@@ -1539,6 +1542,7 @@ impl EditorApp {
             margin: Margin::default(),
             review: Review::default(),
             said: Said::default(),
+            cards: Cards::default(),
             note: None,
             naming: false,
             renaming: None,
@@ -2034,7 +2038,12 @@ impl EditorApp {
         match asked {
             // What is written in the field changes nothing but itself.
             Noting::Wrote(asked) => {
-                let Some((written, row)) = self.margin.written() else { return };
+                // A press in the reply of a card the caret opened turns to the card.
+                let card = self.margin.reading().is_some_and(|(note, _)| self.on_card(note));
+                if card {
+                    self.margin.turn();
+                }
+                let Some((written, row)) = self.margin.written(card.then_some(cards::SAID)) else { return };
                 let layout = self.said.layout(self.palette);
                 let desk = comment::Desk { keys: self.editor.keymap(), layout, width: comment::width(row) };
                 return written.does(asked, desk, platform);
@@ -2067,6 +2076,7 @@ impl EditorApp {
                 self.edits += u64::from(self.margin.answer(created));
             }
             Noting::Resolve => self.edits += u64::from(self.margin.resolve()),
+            Noting::ResolveNote(id) => self.edits += u64::from(self.margin.resolve_note(&id)),
             Noting::PutBack => {
                 let Some(back) = self.put_back() else { return };
                 // The page keeps its place while the block comes back, and then shows it with the version
@@ -2145,6 +2155,73 @@ impl EditorApp {
         }
     }
 
+    /// How far down the layout's column the card of a note stands when nothing is in its way: at the first
+    /// line of its passage, or at the top of its block while that is out of view, where only an estimate of
+    /// it is laid out. A note whose text is gone stands at the top of the page.
+    fn card_at(&self, note: &Note, view: Rect) -> f32 {
+        let Some((top, bottom)) = self.layout.band(&note.anchor.block) else { return 0.0 };
+        if bottom < view.y || top > view.y + view.height {
+            return top;
+        }
+        self.note_lines(note).map_or(top, |(first, _)| first.y)
+    }
+
+    /// The cards of the open comments and import notes, over the page area beside the text. `None` where
+    /// the notes open under their passages instead.
+    fn beside(&mut self, room: Size) -> Option<Element<Message>> {
+        if !self.cards.on() {
+            return None;
+        }
+        let (view, palette) = (self.viewport(), self.palette);
+        let notes: Vec<&Note> = self.margin.cards().collect();
+        self.said.keep(notes.len(), |id| notes.iter().any(|note| note.id == id));
+        let open = self.margin.reading().filter(|(note, _)| self.margin.carded(note));
+        let refused = self.margin.refusal();
+        // The reply of the card that is open, or why there is none to write. An import note takes none.
+        let mut under =
+            open.filter(|(note, _)| threads::Kind::of(note) != Some(threads::Kind::Import)).map(|(_, reply)| {
+                match refused {
+                    Some(why) => cards::refusal(why, self.shaper.as_ref()),
+                    None => {
+                        let layout = self.said.layout(palette);
+                        let desk =
+                            comment::Desk { keys: self.editor.keymap(), layout, width: comment::width(cards::SAID) };
+                        let look = (palette.selection, self.shaper.as_ref() as &dyn TextShaper);
+                        let field = reply.field(desk, look, ("Reply", "Reply"), Noting::Answer);
+                        // A card the caret opened leaves the keyboard with the page, until its reply is pressed.
+                        let field = if self.margin.follows() { field } else { field.takes_focus() };
+                        cards::reply(field, reply.is_blank())
+                    }
+                }
+            });
+        let open = open.map(|(note, _)| note.id.as_str());
+        let said: Vec<_> = notes.iter().map(|note| self.said.card(note, cards::SAID, palette)).collect();
+        let wants: Vec<(&str, f32, f32)> = notes
+            .iter()
+            .zip(&said)
+            .map(|(note, said)| {
+                let under = under.as_ref().filter(|_| open == Some(note.id.as_str())).map(|(_, tall)| *tall);
+                (note.id.as_str(), self.card_at(note, view), cards::tall(said, under))
+            })
+            .collect();
+        let tops = self.cards.place(&wants, open);
+        // Only the cards that show are made.
+        let down = TOP - self.scrolled();
+        let mut shown = Vec::new();
+        for (((note, said), (_, _, tall)), top) in notes.iter().zip(&said).zip(&wants).zip(tops) {
+            let top = (top + down).round();
+            if top + tall <= 0.0 || top >= room.height {
+                continue;
+            }
+            let open = open == Some(note.id.as_str());
+            let under = if open { under.take() } else { None };
+            let card = Card { note, said, now: &self.margin.now, open, under, refused: refused.is_some() };
+            shown.push((top, *tall, card.view()));
+        }
+        let left = self.column.0 + self.column.1 + cards::GAP;
+        Some(cards::column(shown, left, room))
+    }
+
     /// The first line of a block that has a marker, in the layout's coordinates, while the block's start
     /// is in view.
     fn marked_line(&self, marker: &threads::Marker, view: Rect) -> Option<Rect> {
@@ -2176,7 +2253,9 @@ impl EditorApp {
         // The block of the conflict that is open has the two versions where its marker would stand.
         let open = self.review.note();
         let stands = |marker: &&threads::Marker| !open.is_some_and(|open| marker.notes.iter().any(|note| note == open));
-        self.margin.marks().iter().filter(stands).filter_map(placed).collect()
+        // Comments and import notes that have cards beside the page need no marker.
+        let marked = |marker: &&threads::Marker| !self.cards.on() || marker.kind == threads::Kind::Conflict;
+        self.margin.marks().iter().filter(stands).filter(marked).filter_map(placed).collect()
     }
 
     /// The block whose marker is at a point of the layout.
@@ -3321,10 +3400,15 @@ impl EditorApp {
     /// Whether something hangs over the page and takes what the pointer does there. A note the caret opened
     /// does not: the page under it is still being written on.
     fn hung(&self) -> bool {
-        let read = self.margin.reading().is_some() && !self.margin.follows();
+        let read = self.margin.reading().is_some_and(|(note, _)| !self.on_card(note)) && !self.margin.follows();
         let asked = self.covered() || self.margin.writing().is_some() || read;
         let listed = self.insert.offers(&self.editor).is_some() || self.fence.offers(&self.editor).is_some();
         asked || listed || Refer::offers(&self.editor).is_some()
+    }
+
+    /// Whether a note shows on a card beside the page, and not under its passage.
+    fn on_card(&self, note: &Note) -> bool {
+        self.cards.on() && self.margin.carded(note)
     }
 
     /// The open comment whose passage the selection ends in.
@@ -3340,7 +3424,8 @@ impl EditorApp {
         // A press opens nothing while the button is down: it may be the start of a selection.
         let free = !(self.dragging || self.away() || self.covered());
         let caret = self.editor.selection().filter(|selection| selection.is_caret()).map(|caret| &caret.head);
-        if self.margin.attend(was, caret, free) {
+        // Cards say when they were written the whole time they show.
+        if self.margin.attend(was, caret, free) || self.cards.on() {
             self.margin.now = platform.wall_time().map(notes::stamp).unwrap_or_default();
         }
     }
@@ -3873,6 +3958,10 @@ impl EditorApp {
                     self.references.press(None);
                     return self.noting(Noting::Press(block), platform);
                 }
+                // A press on the page leaves the card that was turned to, unless a reply is written on it.
+                if self.margin.reading().is_some_and(|(note, _)| self.on_card(note)) {
+                    self.margin.leave(false);
+                }
                 self.margin.forget();
                 // A press on a callout's icon or title opens its card, with the caret inside the callout.
                 if let Some(block) = self.callout_at(at) {
@@ -4274,7 +4363,12 @@ impl EditorApp {
         let page = &self.editor.model().style().page;
         let text = (page.width - page.margin_left - page.margin_right) * PT;
         let width = text.min(room.width - 2.0 * GUTTER).max(1.0);
-        let left = ((room.width - width) / 2.0).max(0.0).round();
+        // The notes have their cards beside the page where the window has the room, unless a conflict
+        // is open: its two versions take the width.
+        let carded = self.margin.cards().next().is_some() && self.margin.reviewing().is_none();
+        let fit = if carded { cards::fit(text, room.width) } else { Fit::Under };
+        let beside = self.cards.left(fit, self.margin.holds(), (width, room.width));
+        let left = beside.unwrap_or(((room.width - width) / 2.0).max(0.0)).round();
         if width != self.column.1 {
             self.layout.update(self.editor.doc(), self.editor.model().style(), width, None);
             self.highlight(None);
@@ -4687,7 +4781,7 @@ impl EditorApp {
                 .on_close(Message::LinkClose);
             // The editor hangs from the caret, in place.
             element = element.popover(editor.at(caret.unwrap_or_default())).cursor(Cursor::Text);
-        } else if let Some((note, reply)) = self.margin.reading().filter(|_| !waits) {
+        } else if let Some((note, reply)) = self.margin.reading().filter(|(note, _)| !waits && !self.on_card(note)) {
             // The note hangs under the last line of its passage. One whose text is gone hangs from the
             // top of the margin its marker stood in.
             let under = self.note_lines(note).map(|(_, last)| self.onto(last));
@@ -5876,6 +5970,11 @@ impl EditorApp {
         if listed || self.refer_key(event, platform) || self.list_key(event, platform) {
             return true;
         }
+        // Escape leaves the card that is open beside the page.
+        let card = self.margin.reading().is_some_and(|(note, _)| self.on_card(note));
+        if event.key == Key::Escape && card && self.margin.leave(true) {
+            return true;
+        }
         // Where a copy is withheld the key for one does nothing, and neither does a cut, which would lose
         // what it could not take.
         let takes = matches!(self.editor.keymap().command(event), Some(Command::Copy | Command::Cut));
@@ -5961,6 +6060,14 @@ impl App for EditorApp {
             (false, true) => self.version(room),
             (false, false) => self.page(room),
         };
+        // The cards of the notes lie over the page area, beside the text.
+        let beside = if printing || away { None } else { self.beside(room) };
+        if beside.is_none() {
+            self.cards.clear();
+        }
+        // What is said at the foot of the page keeps clear of them.
+        let clear = (self.column.0 + self.column.1 + cards::GAP).min(room.width);
+        let foot = Size { width: if beside.is_some() { clear } else { room.width }, ..room };
         let chapters = if away { None } else { self.chapters() };
         // The find bar hangs under the bars, at the end of the page area.
         let find = (self.find.open() && !away && !self.carded()).then(|| {
@@ -5969,17 +6076,18 @@ impl App for EditorApp {
         });
         // What the shell had the window say lies over the foot of the page, and is the first stop after it.
         let told = self.notices.first().filter(|_| !away && !self.carded());
-        let told = told.map(|notice| notices::toast(notice, room));
+        let told = told.map(|notice| notices::toast(notice, foot));
         // So does the toast about an import, once nothing else waits to be said.
         let toast = self.imported.filter(|_| !away && !self.carded()).map(|_| {
             let keys = commands::shortcut(&Act::Note { back: false }, self.editor.keymap(), self.mac);
-            importing::toast(self.margin.imports().0, keys.as_deref(), room)
+            importing::toast(self.margin.imports().0, keys.as_deref(), foot)
         });
         let toast = told.or(toast);
         // So does the toast about what others wrote since the last visit, for one who can look it up.
         let news = self.seen.as_ref().filter(|_| self.rewinds() && !away && !self.carded());
-        let toast = toast.or_else(|| news.and_then(|seen| seen.toast(room)));
-        let page = Element::row().grow(1.0).child(page).children(toast).children(chapters);
+        let toast = toast.or_else(|| news.and_then(|seen| seen.toast(foot)));
+        // A toast is the first stop after the page, so the cards come after it.
+        let page = Element::row().grow(1.0).child(page).children(toast).children(beside).children(chapters);
         let body = Element::row().grow(1.0).child(page).children(panel);
         // The settings and the card about a link come last, so that they lie over whatever else is out.
         let over = self.dialog.view(&self.settings, self.spelling.mine(), window.height);
@@ -6232,6 +6340,7 @@ impl App for EditorApp {
     fn reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
         self.review.still = reduced;
+        self.cards.still = reduced;
         self.references.set_reduced_motion(reduced);
     }
 
@@ -6286,7 +6395,8 @@ impl App for EditorApp {
         let slid = self.review.animate(now_ms);
         let rested = self.peeks.animate(now_ms);
         let named = self.presence.animate(now_ms);
-        [note, toast, slide, fade, light, copied, slid, rested, named].into_iter().flatten().min()
+        let carded = self.cards.animate(now_ms);
+        [note, toast, slide, fade, light, copied, slid, rested, named, carded].into_iter().flatten().min()
     }
 
     fn idle(&mut self) -> Idle {
