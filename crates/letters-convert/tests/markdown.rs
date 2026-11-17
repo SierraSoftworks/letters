@@ -160,6 +160,7 @@ fn reads_every_block() {
         ("- a\n  1. b\n     - c\n- d", &[r#"bullet/0 "a""#, r#"ordered/1 "b""#, r#"bullet/2 "c""#, r#"bullet/0 "d""#]),
         ("```rust\nfn main() {}\n```", &[r#"code:rust "fn main() {}""#]),
         ("    indented\n    code", &[r#"code:- "indented\ncode""#]),
+        ("```\nold\rMac\nlines\n```", &[r#"code:- "old\nMac\nlines""#]),
         ("> quoted\n>\n> - item", &["quote", r#"  p "quoted""#, r#"  bullet/0 "item""#]),
         ("> [!TIP]\n> Try this.", &["callout:tip", r#"  p "Try this.""#]),
         ("above\n\n---\n\nbelow", &[r#"p "above""#, "divider", r#"p "below""#]),

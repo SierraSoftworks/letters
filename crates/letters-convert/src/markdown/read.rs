@@ -291,7 +291,8 @@ impl<'a> Reader<'a, '_> {
         }
     }
 
-    /// The text of a block that holds nothing else, up to its end.
+    /// The text of a block that holds nothing else, up to its end. A carriage return in it ends a line: left
+    /// in, the one before a line's end would be lost each time the text is written and read.
     fn raw(&mut self) -> String {
         let mut text = String::new();
         while let Some((event, _)) = self.next() {
@@ -301,7 +302,7 @@ impl<'a> Reader<'a, '_> {
                 _ => {}
             }
         }
-        text
+        unix_lines(&text)
     }
 
     /// Reads a paragraph that is the line a renderer swaps for a table of contents: `[TOC]`, as
@@ -767,7 +768,7 @@ impl Text {
     }
 }
 
-/// Maths is the one text the parser hands over with the file's own line endings.
+/// Maths and the text of a code block are what the parser hands over with the file's own line endings.
 fn unix_lines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
