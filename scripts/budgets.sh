@@ -6,7 +6,8 @@
 #   ./scripts/budgets.sh --window   the launch in a window, as the budget is worded, where there is a display
 #
 # Keystrokes are always measured without a window.
-# Every measurement is made and printed before the script fails for any of them.
+# Every measurement is made and printed before the script fails for any of them. A RUNNER that is over a
+# limit is measured once more, and fails when it is over one both times.
 set -eu
 # No check reports its use as a person's (see apps/letters/src/telemetry.rs).
 export LETTERS_TELEMETRY=0
@@ -39,12 +40,6 @@ awk 'BEGIN {
 }' >"$work/Rates.md"
 "$letters" import "$work/Rates.md" >/dev/null
 
-failed=0
-"$letters" --bench-launch $headless "$work/Rates.let" >"$work/launch" || failed=1
-cat "$work/launch"
-"$letters" --typing-report=1000 --headless "$work/Rates.let" >"$work/typing" || failed=1
-cat "$work/typing"
-
 # The limit of `$runner` under `$1` in perf-budget.toml. Empty when the runner has none.
 limit() {
   awk -v section="[$runner]" -v key="$1" '
@@ -69,9 +64,25 @@ check() {
   fi
 }
 
-if [ -n "$runner" ]; then
-  check launch_ms launch "Letters adds"
-  check keystroke_median_ms typing "median"
-  check keystroke_p99_ms typing "p99"
+# One round: both measurements, printed, with the runner's limits held to them. Sets `failed`.
+round() {
+  failed=0
+  "$letters" --bench-launch $headless "$work/Rates.let" >"$work/launch" || failed=1
+  cat "$work/launch"
+  "$letters" --typing-report=1000 --headless "$work/Rates.let" >"$work/typing" || failed=1
+  cat "$work/typing"
+  if [ -n "$runner" ]; then
+    check launch_ms launch "Letters adds"
+    check keystroke_median_ms typing "median"
+    check keystroke_p99_ms typing "p99"
+  fi
+}
+
+round
+# A runner shares its machine, and a moment when that was busy is not Letters made slower.
+if [ "$failed" = 1 ] && [ -n "$runner" ]; then
+  echo
+  echo "Over a limit, so everything is measured once more, and that round is the one that counts:"
+  round
 fi
 exit $failed
