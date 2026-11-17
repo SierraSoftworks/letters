@@ -14,11 +14,11 @@ use letters_editor::{
     PreviewEdit, Seek, Spot, TableEdit,
 };
 use letters_layout::{
-    CAPTION_INSET, Callout, DocLayout, Fonts, Palette, Side as Version, Split, Syntax, Uncovered, WordList,
+    CAPTION_INSET, Callout, DocLayout, Fonts, Named, Palette, Side as Version, Split, Syntax, Uncovered, WordList,
 };
 use letters_model::{
     Align as TextAlign, Block, BlockId, BlockKind, Body, Change, Document, Mark, Marker, Note, NoteKind, Notes, Pos,
-    Revision, Selection, Style,
+    Revision, Selection, Style, StyleFont,
 };
 use letters_render::image::{Image, Images};
 use letters_render::{Color, DisplayList, Font, Item, Point, Rect, Size};
@@ -37,6 +37,7 @@ use crate::context::{self, About, Context, Contexting};
 use crate::copying::{self, Copy, CopyFormat, Copying};
 use crate::describe::{self, Whole};
 use crate::element::{Cursor, Element, Fitted, Paint, Pointer};
+use crate::families::{self, Families, FontOffer, Fonting};
 use crate::figures::{self, Grip, Moving, Resizing};
 use crate::finding::{self, Find, Finding};
 use crate::highlight;
@@ -285,6 +286,8 @@ pub enum Message {
     Fence(Fencing),
     /// What is asked of a code block's language and the list that changes it.
     Language(Languaging),
+    /// What is asked of the list of fonts.
+    Font(Fonting),
     /// What is asked of the list of figures under a reference being typed.
     Refer(Picking),
     /// What the settings dialog asks for.
@@ -355,6 +358,7 @@ impl Message {
             Message::Language(_) | Message::Callout(_) | Message::Contents(_) | Message::Preview(_) => true,
             Message::Written(_) | Message::Seen(_) => true,
             Message::Alt(_) | Message::Styles(_) | Message::Restyle(_) | Message::Draft(..) => true,
+            Message::Font(_) => true,
             Message::Apply(_) | Message::Merge(_) | Message::History(_) | Message::Sharing(_) => true,
             Message::Panel(panel) => *panel == Panel::Styles,
             Message::Linked(asked) => matches!(asked, Linking::Embed | Linking::EmbedAll),
@@ -869,6 +873,62 @@ impl Ui<EditorApp> {
         found.extend(app.history.iter_mut().flat_map(History::take_uncovered));
         found.retain(|found| app.uncovered.insert(found.ch));
         found
+    }
+
+    /// Names the families the shell can find faces for, beside the bundled ones: the fonts of the device
+    /// and of a library. The bar's font menu then offers a list that finds one by name. A family is only
+    /// a name to a style, so the list costs no font file: [`Self::take_named`] says which faces to find.
+    pub fn set_families(&mut self, offers: Vec<FontOffer>) {
+        self.app_mut().families.set(offers);
+    }
+
+    /// The faces the window's text asked for since this was last asked that are none of the bundled
+    /// families': on the page, in an earlier version, in a note. Each family, weight and slant is told once
+    /// for as long as the window lives, as a style or a mark names it. Hand what is found to
+    /// [`Self::add_named_fonts`]: a variable face answers every weight asked of its family.
+    ///
+    /// Faces are met as text is laid out, so ask after a frame. It costs nothing when there are none, and
+    /// asks for no frame.
+    pub fn take_named(&mut self) -> Vec<Named> {
+        let app = self.app_unseen();
+        let mut found = app.layout.take_named();
+        found.extend(app.said.take_named());
+        found.extend(app.review.take_named());
+        found.extend(app.history.iter_mut().flat_map(History::take_named));
+        found.retain(|found| !FAMILIES.iter().any(|(own, _)| own.eq_ignore_ascii_case(&found.family)));
+        found.retain(|found| app.named.insert(Named { family: found.family.to_lowercase(), ..found.clone() }));
+        found
+    }
+
+    /// Adds faces of families that styles name, which the shell found on the device or fetched. Text that
+    /// names one is set in it from the next frame, and until then in the bundled family that stands in.
+    /// The faces are kept for whatever is laid out later, in this window or another.
+    pub fn add_named_fonts(&mut self, faces: Vec<Font>) {
+        families::keep(&faces);
+        let fonts = Fonts { faces };
+        let app = self.app_mut();
+        app.said.again();
+        app.review.add_fonts(&fonts);
+        if let Some(history) = &mut app.history {
+            history.add_fonts(&fonts);
+        }
+        if app.held(|app| app.layout.add_fonts(&fonts)) {
+            // Blocks set again keep their heights as estimates until idle time settles them.
+            app.estimated = true;
+        }
+    }
+
+    /// Lists in the document's style the font files the shell has stored among its assets, so that the
+    /// document carries the faces its text is set in: the whole list, which takes the place of the one
+    /// before. It is an edit like any other, and none when the style lists them already.
+    pub fn keep_fonts(&mut self, fonts: &[StyleFont], platform: &mut dyn Platform) {
+        let app = self.app_mut();
+        let mut style = app.editor.model().style().clone();
+        style.set_fonts(fonts);
+        if style != *app.editor.model().style() {
+            let change = app.run(platform, |editor, platform| editor.run(Command::ReplaceStyle(style), platform));
+            app.follow(&change);
+        }
     }
 
     /// Hands over the word list of a script that is written without spaces, as [`WordList::data`] gives it.
@@ -1472,6 +1532,8 @@ pub struct EditorApp {
     code_copy: CodeCopy,
     fence: Fence,
     languages: Languages,
+    /// The fonts the shell can find, and the list that finds one.
+    families: Families,
     tables: Tables,
     /// The callouts' icons and titles under the pointer, and the card of one.
     callouts: Callouts,
@@ -1498,11 +1560,13 @@ pub struct EditorApp {
     lists: WordLists,
     /// The scripts without their word list that the shell was told of. None is told twice.
     unlisted: HashSet<WordList>,
+    /// The faces styles named that the shell was told of. None is told twice.
+    named: HashSet<Named>,
 }
 
 impl EditorApp {
     fn new(editor: Editor, shaper: Rc<FontShaper>) -> Self {
-        let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+        let mut layout = DocLayout::new(crate::families::fonts());
         // A formula stays typeset under the caret: its source is written on a sheet under it.
         layout.set_formula_source(false);
         Self {
@@ -1588,6 +1652,7 @@ impl EditorApp {
             code_copy: CodeCopy::default(),
             fence: Fence::default(),
             languages: Languages::default(),
+            families: Families::default(),
             tables: Tables::default(),
             callouts: Callouts::default(),
             contents: Contents::default(),
@@ -1601,6 +1666,7 @@ impl EditorApp {
             uncovered: HashSet::new(),
             lists: WordLists::default(),
             unlisted: HashSet::new(),
+            named: HashSet::new(),
         }
     }
 
@@ -2553,6 +2619,7 @@ impl EditorApp {
         (self.context, self.callouts.open, self.tables.open, self.renaming) = (None, None, None, None);
         (self.picked, self.draft) = (None, None);
         self.languages.close();
+        self.families.close();
         self.insert.close();
         self.fence.close();
         self.commands.close();
@@ -3618,6 +3685,39 @@ impl EditorApp {
             self.mark();
         }
         self.languaging(Languaging::Open, platform);
+    }
+
+    /// The families the document's style names, each once.
+    fn families_used(&self) -> Vec<&str> {
+        let mut used: Vec<&str> = Vec::new();
+        for style in self.editor.model().style().types.values() {
+            if !used.iter().any(|family| family.eq_ignore_ascii_case(&style.family)) {
+                used.push(&style.family);
+            }
+        }
+        used
+    }
+
+    /// Does what the list of fonts asked.
+    fn fonting(&mut self, asked: Fonting, platform: &mut dyn Platform) {
+        let taken = match asked {
+            Fonting::Open if self.element().is_some() => return self.families.open(),
+            Fonting::Open => return,
+            Fonting::Type(typed) => return self.families.typed(typed),
+            Fonting::Step { down } => {
+                let used: Vec<String> = self.families_used().into_iter().map(str::to_owned).collect();
+                let used: Vec<&str> = used.iter().map(String::as_str).collect();
+                return self.families.step(down, &used);
+            }
+            Fonting::Take(index) => Some(index),
+            Fonting::Enter => None,
+            Fonting::Close => return self.families.close(),
+        };
+        let used: Vec<String> = self.families_used().into_iter().map(str::to_owned).collect();
+        let used: Vec<&str> = used.iter().map(String::as_str).collect();
+        if let Some(family) = self.families.take(taken, &used) {
+            self.restyle(&StyleEdit::Family(family), platform);
+        }
     }
 
     /// Does what the language of a code block, or the list that changes it, asked.
@@ -5183,6 +5283,15 @@ impl EditorApp {
             let pick = Message::Restyle(StyleEdit::Family(family.into()));
             fonts = fonts.item(MenuItem::new(family).face(face).checked(style.family == family).on_select(pick));
         }
+        // The other families the document's style names, which another type may take in one press.
+        let used = self.families_used();
+        for family in used.iter().filter(|family| !FAMILIES.iter().any(|(own, _)| own.eq_ignore_ascii_case(family))) {
+            let pick = Message::Restyle(StyleEdit::Family((*family).into()));
+            fonts = fonts.item(MenuItem::new(*family).checked(style.family == *family).on_select(pick));
+        }
+        if self.families.any() {
+            fonts = fonts.item(MenuItem::new("More fonts…").on_select(Message::Font(Fonting::Open)));
+        }
         fonts = fonts.heading("Weight");
         for (weight, name) in WEIGHTS {
             let pick = Message::Restyle(StyleEdit::Weight(weight));
@@ -5207,7 +5316,7 @@ impl EditorApp {
                 Element::text(style.family.clone(), TextStyle::control().size(tokens::TEXT_SM).family(face)).grow(1.0),
             )
             .child(Element::icon(icon::CHEVRON_DOWN, 14.0).fg(tokens::FG_MUTED))
-            .popover(fonts.popover());
+            .popover(if self.families.is_open() { self.families.card(&used) } else { fonts.popover() });
 
         let size = self.field(Field::Size, element, style).width(56.0);
 
@@ -5788,6 +5897,7 @@ impl EditorApp {
             Message::Fence(Fencing::Take(index)) => self.fence(index, platform),
             Message::Fence(Fencing::Close) => self.fence.close(),
             Message::Language(asked) => self.languaging(asked, platform),
+            Message::Font(asked) => self.fonting(asked, platform),
             Message::Refer(Picking::Take(figure)) => self.refer(figure, platform),
             Message::Linked(asked) => self.linking(asked),
             Message::TableMenu => self.tables.open = None,

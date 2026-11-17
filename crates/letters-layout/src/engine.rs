@@ -34,6 +34,15 @@ pub struct Uncovered {
     pub lang: Option<String>,
 }
 
+/// A face a style names. See [`crate::DocLayout::take_named`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Named {
+    /// The family, as the style writes it.
+    pub family: String,
+    pub weight: u16,
+    pub italic: bool,
+}
+
 /// How one stretch of text is set.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Spec<'a> {
@@ -77,6 +86,8 @@ pub(crate) struct Engine {
     /// The characters met without a glyph since they were last taken: whether each is an emoji, and the
     /// language of its text.
     missed: Vec<(char, bool, Option<Language>)>,
+    /// Every face text has asked for, and how many of them have been told.
+    named: (Vec<Named>, usize),
     /// The word lists handed over, and the scripts met without theirs.
     pub lists: Lists,
     /// Whether text shaped since this was last cleared asked for a face that is not registered, and so was
@@ -109,6 +120,7 @@ impl Engine {
             maps: Vec::new(),
             covered: HashMap::new(),
             missed: Vec::new(),
+            named: (Vec::new(), 0),
             lists: Lists::default(),
             short: false,
         };
@@ -249,6 +261,14 @@ impl Engine {
         self.missed.drain(..).map(told).collect()
     }
 
+    /// The faces text has asked for since this was last asked, each once.
+    pub fn take_named(&mut self) -> Vec<Named> {
+        let (named, told) = &mut self.named;
+        let new = named[*told..].to_vec();
+        *told = named.len();
+        new
+    }
+
     /// The blob registered with these bytes.
     fn source(&self, data: &FontBytes) -> Option<u64> {
         self.sources.iter().find(|(_, known)| known.same(data) || **known == **data).map(|(id, _)| *id)
@@ -324,7 +344,7 @@ impl Engine {
                 locale: None,
             };
             let mut layout = Layout::new();
-            self.build(text, &[spec], &[(0, 0..text.len())], None, &mut layout);
+            self.measure(text, spec, &mut layout);
             layout.break_all_lines(None);
             layout.full_width()
         };
@@ -343,6 +363,14 @@ impl Engine {
         layout: &mut Layout<Brush>,
     ) {
         self.build_with(text, specs, runs, &[], false, locale, BaseDirection::Auto, layout);
+    }
+
+    /// As [`Engine::build`] for one stretch of text that is only measured and shown nowhere: the face it
+    /// asks for is not told as one a page needs.
+    pub fn measure(&mut self, text: &str, spec: Spec, layout: &mut Layout<Brush>) {
+        let told = self.named.0.len();
+        self.build(text, &[spec], &[(0, 0..text.len())], None, layout);
+        self.named.0.truncate(told);
     }
 
     /// As [`Engine::build`], with `boxes` set in the line, each at a U+FFFC of the text. `by_words` keeps a
@@ -364,6 +392,16 @@ impl Engine {
             self.faces.iter().any(|(family, italic)| *italic == spec.italic && family.eq_ignore_ascii_case(spec.family))
         };
         self.short |= !specs.iter().all(has);
+        for spec in specs {
+            // Weights are whole numbers wherever a style or a mark sets one.
+            let weight = spec.weight as u16;
+            let known = |named: &Named| {
+                named.weight == weight && named.italic == spec.italic && named.family.eq_ignore_ascii_case(spec.family)
+            };
+            if !self.named.0.iter().any(known) {
+                self.named.0.push(Named { family: spec.family.to_owned(), weight, italic: spec.italic });
+            }
+        }
         for (spec, range) in runs {
             let locale = specs.get(usize::from(*spec)).and_then(|spec| spec.locale).or(locale);
             self.note(text.get(range.clone()).unwrap_or_default(), locale);

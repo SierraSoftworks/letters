@@ -406,6 +406,12 @@ impl Harness<EditorApp> {
         self
     }
 
+    /// Lists the font files a shell stored for the document, as one that keeps a document's fonts does.
+    pub fn keep_fonts(&mut self, fonts: &[letters_model::StyleFont]) -> &mut Self {
+        self.ui.keep_fonts(fonts, &mut self.platform);
+        self
+    }
+
     /// Holds a finger on a point, as a touch screen's shell passes it on. Returns whether a word was
     /// selected.
     pub fn long_press_at(&mut self, at: Point) -> bool {

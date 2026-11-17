@@ -12,7 +12,21 @@
       "description": "Keyed by element type: title, heading1 to heading4, body, quote, code and caption.",
       "additionalProperties": { "$ref": "#/$defs/text_style" }
     },
-    "page": { "$ref": "#/$defs/page" }
+    "page": { "$ref": "#/$defs/page" },
+    "fonts": {
+      "type": "array",
+      "description": "The faces the document holds for the families its types name, so that it reads the same where a family is not installed. A stylesheet may list them too: a document that takes it fetches what it lacks.",
+      "items": {
+        "type": "object",
+        "required": ["family", "weight", "italic", "asset"],
+        "properties": {
+          "family": { "type": "string", "pattern": "\\S" },
+          "weight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+          "italic": { "type": "boolean" },
+          "asset": { "type": "string", "pattern": "^assets/", "description": "The font file among the document's assets, as assets/<sha256>.ttf." }
+        }
+      }
+    }
   },
   "$defs": {
     "text_style": {

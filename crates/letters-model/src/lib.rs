@@ -29,5 +29,5 @@ pub use markers::{Marker, Markers};
 pub use model::{Change, Model, Op, OpError, Place, Prepared};
 pub use notes::{Anchor, NOTES_FORMAT, Note, NoteKind, Notes, Reply, Stood, Version};
 pub use pos::{Pos, Selection};
-pub use style::{Align, Page, STYLE_FORMAT, Style, TextStyle};
+pub use style::{Align, Page, STYLE_FORMAT, Style, StyleFont, TextStyle};
 pub use versions::{Point, Tag, TagKind};

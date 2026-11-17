@@ -123,7 +123,7 @@ impl Types {
             // allows for the ragged ends of wrapped lines.
             const SAMPLE: &str = "The style of a document decides how wide its words run, and so how tall it is.";
             let spec = resolved.spec(*role == Role::Code, Brush::default());
-            engine.build(SAMPLE, &[spec], &[(0, 0..SAMPLE.len())], None, &mut scratch);
+            engine.measure(SAMPLE, spec, &mut scratch);
             scratch.break_all_lines(None);
             if scratch.full_width() > 0.0 {
                 resolved.advance = scratch.full_width() / SAMPLE.len() as f32 * 1.04;

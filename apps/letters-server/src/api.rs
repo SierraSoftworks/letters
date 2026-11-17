@@ -453,7 +453,9 @@ async fn add_asset(
         found.must(Role::Editor)?;
         let entry = asset_entry(&name)?;
         // The bytes say what they are, whatever the request calls them.
-        if letters_trust::ImageType::sniff(&bytes).is_none() {
+        // A font file a writer chose is kept with the document as its pictures are.
+        let font = entry.ends_with(".ttf") && letters_fonts::is_font(&bytes);
+        if !font && letters_trust::ImageType::sniff(&bytes).is_none() {
             return Err(Refusal::invalid("That is not a picture Letters can show."));
         }
         // The same bytes go by the same name, so one the file holds is not taken twice.

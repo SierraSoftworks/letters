@@ -725,8 +725,10 @@ impl Room {
             return Ok(());
         }
         let named: Vec<String> = {
-            let document = self.copy.model().doc().assets();
-            self.offered.keys().filter(|name| document.contains(name.as_str())).cloned().collect()
+            // The style names its font files as the document names its pictures.
+            let (document, style) = (self.copy.model().doc().assets(), self.copy.model().style().assets());
+            let named = |name: &&String| document.contains(name.as_str()) || style.contains(name.as_str());
+            self.offered.keys().filter(named).cloned().collect()
         };
         let mut journalled = Ok(());
         for name in named {

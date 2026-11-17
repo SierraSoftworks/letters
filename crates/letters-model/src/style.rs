@@ -3,7 +3,7 @@
 //! A `.letstyle` stylesheet is the same JSON in a file of its own. Reading is strict and fills anything missing
 //! from the built-in style, and writing is complete and canonical, so a document looks the same everywhere.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
@@ -19,6 +19,17 @@ pub struct Style {
     pub types: BTreeMap<String, TextStyle>,
     pub page: Page,
     pub extra: Extra,
+}
+
+/// A face the document holds for a family its style names, so that it reads the same where the family is
+/// not installed. `fonts` in `style.json` lists them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StyleFont {
+    pub family: String,
+    pub weight: u16,
+    pub italic: bool,
+    /// The font file among the document's assets, as `assets/<sha256>.ttf`.
+    pub asset: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +58,9 @@ pub enum Align {
     End,
     Justify,
 }
+
+/// Where `style.json` lists the faces the document holds.
+const FONTS: &str = "fonts";
 
 pub(crate) const ALIGNS: [(&str, Align); 4] =
     [("start", Align::Start), ("center", Align::Center), ("end", Align::End), ("justify", Align::Justify)];
@@ -151,6 +165,47 @@ impl Style {
         }
         style.extra = map.into_iter().collect();
         Ok(style)
+    }
+
+    /// The faces the document holds for the families its types name. An entry that is not a face is left
+    /// out: the list is kept among the fields a reader need not know.
+    pub fn fonts(&self) -> Vec<StyleFont> {
+        let read = |font: &Value| {
+            Some(StyleFont {
+                family: font.get("family")?.as_str()?.to_owned(),
+                weight: u16::try_from(font.get("weight")?.as_u64()?).ok()?,
+                italic: font.get("italic")?.as_bool()?,
+                asset: font.get("asset")?.as_str()?.to_owned(),
+            })
+        };
+        let listed = self.extra.get(FONTS).and_then(Value::as_array);
+        listed.map(|fonts| fonts.iter().filter_map(read).collect()).unwrap_or_default()
+    }
+
+    /// Lists the faces the document holds, in one order whatever order they are given in. None lists
+    /// nothing.
+    pub fn set_fonts(&mut self, fonts: &[StyleFont]) {
+        let fonts: BTreeSet<&StyleFont> = fonts.iter().collect();
+        let written = |font: &StyleFont| {
+            let mut map = Map::new();
+            map.insert("family".into(), font.family.as_str().into());
+            map.insert("weight".into(), font.weight.into());
+            map.insert("italic".into(), font.italic.into());
+            map.insert("asset".into(), font.asset.as_str().into());
+            Value::Object(map)
+        };
+        match fonts.is_empty() {
+            true => drop(self.extra.remove(FONTS)),
+            false => drop(self.extra.insert(FONTS.into(), fonts.into_iter().map(written).collect())),
+        }
+    }
+
+    /// The names of the assets the style needs: the font files of [`Self::fonts`]. Whatever carries a
+    /// document's assets asks here as it asks `Document::assets`.
+    pub fn assets(&self) -> BTreeSet<&str> {
+        let listed = self.extra.get(FONTS).and_then(Value::as_array);
+        let fonts = listed.into_iter().flatten();
+        fonts.filter_map(|font| font.get("asset")?.as_str()).collect()
     }
 
     /// Writes the canonical `style.json`: every type with every field.

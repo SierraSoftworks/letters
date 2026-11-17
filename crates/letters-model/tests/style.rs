@@ -1,4 +1,4 @@
-use letters_model::{Align, Style};
+use letters_model::{Align, Model, Op, ReplicaId, Style, StyleFont};
 use proptest::prelude::*;
 
 #[test]
@@ -77,4 +77,38 @@ proptest! {
         prop_assert_eq!(&reread, &style);
         prop_assert_eq!(reread.to_json(), written);
     }
+}
+
+#[test]
+fn the_faces_a_document_holds_are_listed_and_named_as_its_assets() {
+    let face = |weight, italic, asset: &str| StyleFont { family: "Lora".into(), weight, italic, asset: asset.into() };
+    let fonts = [face(700, false, "assets/b.ttf"), face(400, true, "assets/c.ttf"), face(400, false, "assets/a.ttf")];
+    let mut style = Style::default();
+    assert!(style.fonts().is_empty() && style.assets().is_empty(), "a style lists none until told");
+
+    style.set_fonts(&fonts);
+    let reread = Style::from_json(&style.to_json()).unwrap();
+    assert_eq!(reread, style, "the list is written and read back");
+    assert_eq!(reread.fonts().len(), 3);
+    assert_eq!(reread.assets().into_iter().collect::<Vec<_>>(), ["assets/a.ttf", "assets/b.ttf", "assets/c.ttf"]);
+
+    let mut other = Style::default();
+    other.set_fonts(&[fonts[2].clone(), fonts[0].clone(), fonts[1].clone(), fonts[1].clone()]);
+    assert_eq!(other, style, "whatever order they are given in, and each once");
+
+    style.set_fonts(&[]);
+    assert_eq!(style, Style::default(), "and a style that holds none says nothing of fonts");
+}
+
+#[test]
+fn the_list_of_faces_travels_with_the_history() {
+    let mut style = Style::default();
+    style.set_fonts(&[StyleFont { family: "Lora".into(), weight: 400, italic: false, asset: "assets/a.ttf".into() }]);
+    let mut model = Model::new(Default::default(), ReplicaId::from(1));
+    model.apply(vec![Op::ReplaceStyle { style: style.clone() }]).unwrap();
+    let copy = model.fork(ReplicaId::from(2));
+    assert_eq!(copy.style().fonts(), style.fonts());
+    // What a reader makes of an entry that is no face.
+    let odd = r#"{"format":1,"fonts":[{"family":"Lora"},"x",{"family":"Lora","weight":400,"italic":false,"asset":"assets/a.ttf"}]}"#;
+    assert_eq!(Style::from_json(odd).unwrap().fonts(), style.fonts(), "only what is a face is listed");
 }

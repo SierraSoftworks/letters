@@ -22,6 +22,7 @@ use letters_layout::{Fonts, Uncovered};
 use letters_model::{Block, Body, Model, ReplicaId, Style};
 use serde_json::json;
 
+use crate::chosen;
 use crate::cli::{Export, Format, Import, Output};
 use crate::fallback;
 use crate::files;
@@ -125,7 +126,11 @@ pub fn exported_with(file: Vec<u8>, title: &str, to: Format, linked: Linked) -> 
         Format::Html => to_html(&document, &style, title, &mut |name| archive.read(name).ok().flatten()).into_bytes(),
         Format::Docx => to_docx(&document, &style, &notes, title, &mut |name| archive.read(name).ok().flatten()),
         Format::Pdf => {
-            let fonts = Fonts { faces: letters_fonts::bundled() };
+            // The fonts its writer chose, as the window sets them: those the file holds, then the system's.
+            let mut faces = letters_fonts::bundled();
+            let mut held = |name: &str| archive.read(name).ok().flatten();
+            faces.extend(chosen::printed(&style, &mut held, || chosen::Chosen::system(None)));
+            let fonts = Fonts { faces };
             let created = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs());
             // Who wrote a document is in its history. A file with none, or with one this build cannot read,
             // names nobody.
@@ -173,10 +178,13 @@ fn clean(package: &mut Package) {
     package.document.prune_previews();
     // The document says which pictures it shows, so that none is left behind here.
     let shown = package.document.assets();
+    // The style's font files stay with it. A style this build cannot read names none it knows of.
+    let style = package.style().unwrap_or_default();
+    let fonts = style.assets();
     let kept = |name: &str| match name {
         NOTES => false,
         name if name.starts_with(HISTORY) => false,
-        name if name.starts_with(ASSETS) => shown.contains(name),
+        name if name.starts_with(ASSETS) => shown.contains(name) || fonts.contains(name),
         _ => true,
     };
     package.entries.retain(|name, _| kept(name));

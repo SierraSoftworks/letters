@@ -16,7 +16,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use accesskit::{Node, NodeId};
-use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Uncovered, Window, WordList};
+use letters_layout::{Arrangement, DocLayout, Fonts, Named, Palette, Piece, Side, Split, Uncovered, Window, WordList};
 use letters_model::{Block, BlockId, BlockKind, Body, Document, Note, NoteKind, Pos, Selection, Style, Version};
 use letters_render::{Color, DisplayList, Item, Point, Rect, Size};
 
@@ -154,7 +154,7 @@ impl Open {
             page: on_page,
             held: None,
             doc: doc.clone(),
-            first: DocLayout::new(Fonts { faces: letters_fonts::bundled() }),
+            first: DocLayout::new(crate::families::fonts()),
             laid: None,
             active: Side::Second,
             slide: 1.0,
@@ -275,6 +275,11 @@ impl Review {
     pub fn add_fallback_fonts(&mut self, fonts: &Fonts) -> bool {
         self.backup.faces.extend(fonts.faces.iter().cloned());
         self.open.as_mut().is_some_and(|open| open.first.add_fallback_fonts(fonts))
+    }
+
+    /// The faces the version held back asked for since this was last asked.
+    pub fn take_named(&mut self) -> Vec<Named> {
+        self.open.as_mut().map(|open| open.first.take_named()).unwrap_or_default()
     }
 
     /// The characters the version held back showed without a glyph since this was last asked.

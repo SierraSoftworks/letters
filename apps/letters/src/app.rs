@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 use letters_editor::{Editor, InputEvent, KeyEvent, Picture, Platform as _};
 use letters_format::WorkingCopy;
 use letters_frame::Lights;
+use letters_layout::Named;
 use letters_model::{BlockId, Change, Model, Notes, ReplicaId, Revision, Selection, Style, TagKind};
 use letters_render::image::Image;
 use letters_render::{Color, DisplayList, Font, Point, Size};
@@ -26,9 +28,9 @@ use letters_sync::{Local, Progress, Refusal};
 use letters_trust::{FetchError, Gate, HttpsUrl, ImageDecision, Limits, MergeDecision, Origin, Trust, TrustError};
 // The editor's window is the view here, where `Window` is the system's.
 use letters_ui::{
-    Access, Allows, Appearance, Browsed, Chrome, Connection, CopyFormat, Cursor, Edge, Frame, ImportFolder, ImportKind,
-    ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, Notice, PictureState, Request, SafeMode,
-    SaveState, Scheme, Settings, SignIn, Stored, Window as View, tokens,
+    Access, Allows, Appearance, Browsed, Chrome, Connection, CopyFormat, Cursor, Edge, FontOffer, Frame, ImportFolder,
+    ImportKind, ImportOffer, Landing, LinkPreviewFound, Location, MergeAsk, MergeFile, Notice, PictureState, Request,
+    SafeMode, SaveState, Scheme, Settings, SignIn, Stored, Window as View, tokens,
 };
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use winit::application::ApplicationHandler;
@@ -41,6 +43,7 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes, WindowId};
 
+use crate::chosen::{self, Chooser, Chosen};
 use crate::chrome::{self, Buttons, Host};
 use crate::cli::{Format, Mode, Options};
 use crate::conflicts;
@@ -48,7 +51,7 @@ use crate::connected::{self, Line, Placed, Placing, Reached, Said, Sharing, Shel
 use crate::convert;
 use crate::copies;
 use crate::dictionaries;
-use crate::fallback::Finder;
+use crate::fallback::{BUNDLED, Finder};
 use crate::files::{self, EXTENSION, Exchange, Home, Merged, Opened, Rest, STYLESHEET, Working};
 use crate::gpu::Gpu;
 use crate::import::{self, Choices, Plan, Unplanned};
@@ -115,6 +118,10 @@ pub enum Event {
     Copied(WindowId, PathBuf, Result<Option<String>, copies::Refused>),
     /// Faces of the system were found for characters a window showed without a glyph.
     Faces(WindowId, Vec<Font>),
+    /// The families a writer can choose a font from have been listed.
+    Families(Vec<FontOffer>),
+    /// The faces of the fonts a window's document names were looked for.
+    Chosen(WindowId, Box<chosen::Found>),
     /// What a window's first paint did not need has been read.
     Read(WindowId),
     /// A newer release of Letters was found, and fetched where it can take this one's place.
@@ -266,6 +273,8 @@ pub fn run(options: Options, mut launch: Launch) -> Result<(), Box<dyn Error>> {
             let proxy = event_loop.create_proxy();
             move |id, faces| drop(proxy.send_event(Event::Faces(id, faces)))
         }),
+        chosen: Chooser::idle(),
+        families: Vec::new(),
         mods: ModifiersState::empty(),
         bar: None,
         bar_stale: false,
@@ -512,6 +521,10 @@ struct App {
     parting: Vec<JoinHandle<bool>>,
     /// Looks among the system's fonts for what the bundled ones cannot draw, once a window shows any.
     fonts: Finder<WindowId>,
+    /// Finds the faces of the fonts a writer chose, from the first frame on.
+    chosen: Chooser<WindowId>,
+    /// The families a writer can choose from, once they are listed.
+    families: Vec<FontOffer>,
     mods: ModifiersState,
     /// The menus macOS shows at the top of the screen. `None` elsewhere, and until a window is up.
     bar: Option<Bar>,
@@ -732,6 +745,16 @@ struct DocWindow {
     located: Option<(Option<String>, PathBuf)>,
     /// The person's own dictionary as this window last read it.
     words_seen: words::Stamp,
+    /// The faces the window's text has asked for that are none of the bundled families'.
+    fonts_named: Vec<Named>,
+    /// What the fonts were last looked for: a hash of the faces the style can ask for, the font files it
+    /// lists, the faces the text has asked for, and whether the document may keep fonts. They are looked
+    /// for again when it changes.
+    fonts_seen: Option<u64>,
+    /// The families the person was told are not to be had, each once.
+    fonts_said: BTreeSet<String>,
+    /// The font files asked of the document's server, each once.
+    fonts_asked: BTreeSet<String>,
     /// Whether the primary button went down as a secondary one, as it does with Control held on a Mac.
     menu_press: bool,
     /// Whether the document was made in this window, which is what makes it trusted from the start.
@@ -1125,6 +1148,10 @@ impl DocWindow {
         again.iter().for_each(|name| _ = self.held.insert(name.clone(), within));
         if !self.busy() {
             again.append(&mut self.awaited);
+            // The document's fonts waited too, and are looked for after the next frame.
+            if self.fonts_seen.is_none() {
+                self.window.request_redraw();
+            }
         }
         again.into_iter().for_each(|name| self.want(name, decoder, proxy));
     }
@@ -1388,6 +1415,57 @@ impl DocWindow {
                 }
             }
         });
+    }
+
+    /// What to ask about the document's fonts, when it names any beyond the bundled ones and something
+    /// changed since they were last looked for. A document that may be written and is trusted keeps the
+    /// faces of the library's families with it.
+    fn fonts(&mut self, trust: &Trust) -> Option<chosen::Ask> {
+        self.fonts_named.extend(self.view.take_named());
+        // A file that is being read has not said which document it is, nor given up its font files, and
+        // one that is being saved may be about to hold them. The fonts wait: see `ask_again`.
+        if self.busy() {
+            self.fonts_seen = None;
+            return None;
+        }
+        let writes = self.remote.as_ref().is_none_or(|remote| remote.access() == Access::Edits);
+        let keeps = writes && self.trusted(trust);
+        let style = self.view.editor().model().style();
+        let (listed, faces) = (style.fonts(), letters_layout::faces(style));
+        let mut seen = DefaultHasher::new();
+        (&faces, &listed, &self.fonts_named, keeps).hash(&mut seen);
+        if self.fonts_seen.replace(seen.finish()) == Some(seen.finish()) {
+            return None;
+        }
+        let bundled = |face: &Named| BUNDLED.iter().any(|own| own.eq_ignore_ascii_case(&face.family));
+        if self.fonts_named.is_empty() && listed.is_empty() && faces.iter().all(bundled) {
+            return None;
+        }
+        let held = |name: &str| self.assets.get(name).or_else(|| self.copy.as_ref()?.entries.get(name)).cloned();
+        let unsaved = listed.iter().filter_map(|font| Some((font.asset.clone(), held(&font.asset)?))).collect();
+        let file = self.file().map(Path::to_owned);
+        Some(chosen::Ask { named: self.fonts_named.clone(), listed, unsaved, file, keep: keeps.then_some(faces) })
+    }
+
+    /// Takes what was found of the document's fonts: sets its text in the faces, keeps the font files that
+    /// are new with it, and says once which families are not to be had.
+    fn chose(&mut self, found: chosen::Found, platform: &mut Desktop) {
+        let chosen::Found { faces, stored, listed, lacking, unfetched, absent: _ } = found;
+        // The files first: the document's server is handed them before the edit that names them.
+        self.keep(stored);
+        if !faces.is_empty() {
+            self.view.add_named_fonts(faces);
+        }
+        if let Some(listed) = listed {
+            self.view.keep_fonts(&listed, platform);
+        }
+        let says = [(lacking, NO_FONT, "OK", FONT_KEY), (unfetched, NO_FETCH, TRY_AGAIN, FETCH_KEY)];
+        for (families, sentence, button, key) in says {
+            for family in families.into_iter().filter(|family| self.fonts_said.insert(family.to_lowercase())) {
+                let sentence = sentence.replace("{}", &family);
+                self.view.notify(Notice { sentence, button: button.into(), key: format!("{key}{family}") });
+            }
+        }
     }
 
     /// Names the languages there are dictionaries for, for the Language dialog and the settings to offer:
@@ -2349,6 +2427,17 @@ fn say(file: &Path, said: &str) {
 /// What the button of a notice about a journal that was set aside is called.
 const SHOW_FILE: &str = "Show file";
 
+/// What is said of a family nothing here has, which is named where the braces are.
+const NO_FONT: &str = "This document uses the font {}, which is not on this device. Its text is shown in another font.";
+/// What is said of a family of the library that could not be fetched.
+const NO_FETCH: &str =
+    "The font {} could not be fetched from Google Fonts. Its text is shown in another font until it can be.";
+/// What the button that fetches it again is called.
+const TRY_AGAIN: &str = "Try again";
+/// What the keys of those two notices start with, before the family.
+const FONT_KEY: &str = "font:";
+const FETCH_KEY: &str = "font-fetch:";
+
 fn alert(parent: Option<&Arc<Window>>, message: &str) {
     eprintln!("letters: {message}");
     let dialog = MessageDialog::new().set_level(MessageLevel::Error).set_title("Letters").set_description(message);
@@ -2427,6 +2516,10 @@ impl App {
             listed: None,
             located: None,
             words_seen: None,
+            fonts_named: Vec::new(),
+            fonts_seen: None,
+            fonts_said: BTreeSet::new(),
+            fonts_asked: BTreeSet::new(),
             menu_press: false,
             made_here,
             vouch: None,
@@ -2511,6 +2604,7 @@ impl App {
         self.mark("window shown");
         window.window.request_redraw();
         let id = window.window.id();
+        window.view.set_families(self.families.clone());
         self.windows.insert(id, window);
         Ok(id)
     }
@@ -2786,6 +2880,14 @@ impl App {
                     self.browse(id, server, place, Some(document), now);
                 }
                 Request::NoticePressed(key) if key == update::KEY => self.take_update(event_loop, id),
+                Request::NoticePressed(key) if key.starts_with(FETCH_KEY) => {
+                    // The fonts are looked for again, and what still cannot be fetched is said again.
+                    let Some(window) = self.windows.get_mut(&id) else { continue };
+                    window.fonts_said.remove(&key[FETCH_KEY.len()..].to_lowercase());
+                    window.fonts_seen = None;
+                    window.window.request_redraw();
+                }
+                Request::NoticePressed(key) if key.starts_with(FONT_KEY) => {}
                 Request::NoticePressed(key) => self.show_kept(id, &key),
                 Request::BrowseTrash { server } => self.browse_trash(id, server, None, now),
                 Request::PutBack { server, space, file } => self.browse_trash(id, server, Some((space, file)), now),
@@ -4085,7 +4187,7 @@ impl ApplicationHandler<Event> for App {
         // What a window offers changes with what is done in it, not with where the pointer is or a frame.
         let passing = matches!(event, WindowEvent::CursorMoved { .. } | WindowEvent::RedrawRequested);
         self.bar_stale |= !passing;
-        let Self { windows, platform, mods, library, fonts, .. } = self;
+        let Self { windows, platform, mods, library, fonts, chosen, trust, .. } = self;
         let Some(window) = windows.get_mut(&id) else { return };
         window.access.process_event(&window.window, &event);
         let mut action = None;
@@ -4099,6 +4201,12 @@ impl ApplicationHandler<Event> for App {
                 let uncovered = window.view.take_uncovered();
                 if !uncovered.is_empty() {
                     fonts.ask(id, uncovered);
+                }
+                // The fonts a writer chose are looked for the same way, once there is a thread for it.
+                if chosen.started()
+                    && let Some(ask) = window.fonts(trust.trust())
+                {
+                    chosen.ask(id, ask);
                 }
                 if let Some(mut launch) = self.launch.take() {
                     launch.mark(FIRST_FRAME);
@@ -4139,6 +4247,13 @@ impl ApplicationHandler<Event> for App {
                             });
                         }
                     }
+                    // Nor the fonts a writer can choose from, which are the system's and a library's.
+                    let (home, offered, answered) = (self.home.clone(), self.proxy.clone(), self.proxy.clone());
+                    self.chosen.start(
+                        move || Chosen::system(Some(&home)),
+                        move |offers| drop(offered.send_event(Event::Families(offers))),
+                        move |id, found| drop(answered.send_event(Event::Chosen(id, Box::new(found)))),
+                    );
                     // The desktop is asked over D-Bus, which is not worth holding a frame for.
                     let (proxy, folders) = (self.proxy.clone(), self.dictionaries.clone());
                     thread::spawn(move || {
@@ -4496,6 +4611,17 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Brought(id, name, brought) => {
                 let Some(window) = self.windows.get_mut(&id) else { return };
+                if window.fonts_asked.contains(&name) {
+                    // A font file: the copy is to hold it, and the fonts are looked for again with it.
+                    if let Some(bytes) = brought {
+                        window.assets.insert(name, bytes);
+                        window.marks = true;
+                        window.save_at.get_or_insert(now + SAVE_AFTER);
+                    }
+                    window.fonts_seen = None;
+                    window.window.request_redraw();
+                    return;
+                }
                 match brought {
                     Some(bytes) => {
                         // No edit, but the copy is to hold it: it goes in with the next save.
@@ -4531,6 +4657,39 @@ impl ApplicationHandler<Event> for App {
                 if window.view.add_fallback_fonts(faces) {
                     window.sync(now);
                 }
+            }
+            Event::Families(offers) => {
+                self.families = offers;
+                for window in self.windows.values_mut() {
+                    window.view.set_families(self.families.clone());
+                    // The frame before this could not ask for its document's fonts yet.
+                    window.window.request_redraw();
+                }
+            }
+            Event::Chosen(id, found) => {
+                let Some(window) = self.windows.get_mut(&id) else { return };
+                let mut found = *found;
+                // What the copy of a server's document lacks is asked of the server, as its pictures are.
+                // Until it answers, nobody is told that a family is missing.
+                let absent = std::mem::take(&mut found.absent);
+                let asked: Vec<String> = match &window.remote {
+                    Some(_) => absent.into_iter().filter(|name| window.fonts_asked.insert(name.clone())).collect(),
+                    None => Vec::new(),
+                };
+                if !asked.is_empty() {
+                    found.lacking.clear();
+                }
+                for name in asked {
+                    let Some(remote) = &window.remote else { break };
+                    let (session, document) = (remote.line.session().clone(), remote.opened.id.clone());
+                    let proxy = self.proxy.clone();
+                    self.fetching.run(move || {
+                        let brought = connected::picture(&session, &document, &name);
+                        let _ = proxy.send_event(Event::Brought(id, name, brought));
+                    });
+                }
+                window.chose(found, &mut self.platform);
+                window.sync(now);
             }
             Event::Planned(id, path, plan, to) => self.offer(id, &path, plan, to),
             Event::Pdf(id, pdf) => {

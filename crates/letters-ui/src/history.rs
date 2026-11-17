@@ -36,7 +36,7 @@ use std::rc::Rc;
 
 use accesskit::{Node, NodeId, Role};
 use letters_editor::{Command, Editor, Key, KeyEvent, Platform};
-use letters_layout::{Arrangement, DocLayout, Fonts, Palette, Piece, Side, Split, Uncovered, WordList};
+use letters_layout::{Arrangement, DocLayout, Fonts, Named, Palette, Piece, Side, Split, Uncovered, WordList};
 use letters_model::{
     Block, BlockId, BlockKind, Body, Change, Document, Point as Step, Pos, ReplicaId, Revision, Selection, Style, Tag,
     TagKind,
@@ -1284,6 +1284,15 @@ impl History {
         shown || quoted
     }
 
+    /// The faces the versions' text asked for since this was last asked.
+    pub fn take_named(&mut self) -> Vec<Named> {
+        let mut found: Vec<Named> = self.setter.iter_mut().flat_map(DocLayout::take_named).collect();
+        let Some(leaf) = &mut self.leaf else { return found };
+        found.extend(leaf.layout.take_named());
+        found.extend(leaf.earlier.iter_mut().flat_map(|(_, layout)| layout.take_named()));
+        found
+    }
+
     /// The characters the versions showed without a glyph since this was last asked.
     pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
         let mut found: Vec<Uncovered> = self.setter.iter_mut().flat_map(DocLayout::take_uncovered).collect();
@@ -1978,7 +1987,7 @@ impl History {
             return;
         }
         let layout = setter.get_or_insert_with(|| {
-            let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+            let mut layout = DocLayout::new(crate::families::fonts());
             layout.add_fallback_fonts(backup);
             lists.hand(&mut layout);
             // What is quoted is only read: a link preview keeps no room for a control.
@@ -2241,7 +2250,7 @@ impl Leaf {
                 (layout, behind)
             }
             None => {
-                let mut layout = DocLayout::new(Fonts { faces: letters_fonts::bundled() });
+                let mut layout = DocLayout::new(crate::families::fonts());
                 layout.add_fallback_fonts(late.0);
                 late.1.hand(&mut layout);
                 // Nothing has a caret here, so a formula is typeset and never shows its source.
