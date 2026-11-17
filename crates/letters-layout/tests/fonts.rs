@@ -354,7 +354,8 @@ fn a_face_a_style_names_is_told_once_and_sets_its_text_when_it_comes() {
 
     let in_chosen = |layout: &DocLayout| {
         let items = painted(layout, everything());
-        glyph_runs(&items).any(|item| matches!(item, Item::Glyphs { font, .. } if font.data.same(&chosen.faces[0].data)))
+        glyph_runs(&items)
+            .any(|item| matches!(item, Item::Glyphs { font, .. } if font.data.same(&chosen.faces[0].data)))
     };
     assert!(!in_chosen(&layout), "until the face comes the heading is set in what there is");
     assert!(layout.add_fonts(&chosen), "the face is taken by its family's name");

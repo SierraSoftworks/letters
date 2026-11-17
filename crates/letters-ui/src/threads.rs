@@ -9,7 +9,7 @@ use std::iter;
 use std::rc::Rc;
 
 use accesskit::Role;
-use letters_layout::{DocLayout, Fonts, Palette, Uncovered, WordList};
+use letters_layout::{DocLayout, Fonts, Named, Palette, Uncovered, WordList};
 use letters_model::{
     Block, BlockId, BlockKind, Body, Document, Note, NoteKind, Pos, Run, Selection, Style, TextStyle as Type, Version,
 };
@@ -269,6 +269,11 @@ impl Said {
         self.layout.as_mut().is_some_and(|layout| layout.add_fallback_fonts(fonts))
     }
 
+    /// The faces that notes asked for since this was last asked.
+    pub fn take_named(&mut self) -> Vec<Named> {
+        self.layout.as_mut().map(DocLayout::take_named).unwrap_or_default()
+    }
+
     /// The characters that notes showed without a glyph since this was last asked.
     pub fn take_uncovered(&mut self) -> Vec<Uncovered> {
         self.layout.as_mut().map(DocLayout::take_uncovered).unwrap_or_default()
@@ -293,7 +298,7 @@ impl Said {
     /// The layout that sets what notes say, in these colours. The field a note is written in is set in
     /// it too ([`crate::comment`]), so that what is written looks as it will once it is kept.
     pub fn layout(&mut self, palette: Palette) -> &mut DocLayout {
-        let fonts = Fonts { faces: letters_fonts::bundled() };
+        let fonts = crate::families::fonts();
         let layout = self.layout.get_or_insert_with(|| {
             let mut layout = DocLayout::new(fonts.clone());
             layout.add_fallback_fonts(&self.backup);
