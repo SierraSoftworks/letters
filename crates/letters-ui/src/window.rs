@@ -2230,7 +2230,13 @@ impl EditorApp {
     /// line of its passage, or at the top of its block while that is out of view, where only an estimate of
     /// it is laid out. A note whose text is gone stands at the top of the page.
     fn card_at(&self, note: &Note, view: Rect) -> f32 {
-        let Some((top, bottom)) = self.layout.band(&note.anchor.block) else { return 0.0 };
+        // A table or a row has no place of its own in the layout: its first text has.
+        let inside = || {
+            let mut texts = Vec::new();
+            written(self.editor.doc().block(&note.anchor.block)?, &mut texts);
+            self.layout.band(&texts.first()?.id)
+        };
+        let Some((top, bottom)) = self.layout.band(&note.anchor.block).or_else(inside) else { return 0.0 };
         if bottom < view.y || top > view.y + view.height {
             return top;
         }

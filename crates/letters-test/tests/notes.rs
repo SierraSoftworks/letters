@@ -1242,3 +1242,27 @@ fn the_cards_go_with_the_page_as_it_scrolls_and_the_wheel_works_over_them() {
     assert!(moved.y < line.y, "the wheel over a card scrolls the page");
     assert_eq!(after[0].bounds.y - before[0].bounds.y, moved.y - line.y, "and the card goes with its line");
 }
+
+#[test]
+fn the_card_of_a_note_on_a_table_or_a_part_of_it_stands_beside_the_table() {
+    let mut window = Harness::doc(
+        "Costs so far.\n\nOne.\n\nTwo.\n\nThree.\n\nFour.\n\nAnd as agreed:\n\n| Item | Cost |\n| --- | --- |\n| Slates | 900 |",
+    );
+    let doc = window.editor().doc().clone();
+    let table = doc.blocks.last().expect("a table");
+    let row = &table.body.blocks()[1];
+    let (head, cells) = (&table.body.blocks()[0].body.blocks()[0], row.body.blocks());
+    // What the note is on, and the text it is level with: the table, a row of it, and a cell of that row.
+    let cases = [(&table.id, &head.id), (&row.id, &cells[0].id), (&cells[1].id, &cells[1].id)];
+    let first = caret_at(&mut window, doc.blocks[0].id.as_str(), 0);
+    for (on, level) in cases {
+        let top = note("top", NoteKind::Comment, Anchor::block(doc.blocks[0].id.as_str()), "How much?");
+        let split = note("split", NoteKind::Import, Anchor::block(on.as_str()), "Merged table cells were split");
+        window.ui().set_notes(Notes { notes: vec![top, split], ..Notes::default() });
+        let all = cards(&mut window);
+        let line = caret_at(&mut window, level.as_str(), 0);
+        // As far under the first card as its line is under the first line of the page.
+        let (card, down) = (all[1].bounds.y - all[0].bounds.y, line.y - first.y);
+        assert!((card - down).abs() < line.height, "{on:?}: the card is level with it: {card} {down}");
+    }
+}
