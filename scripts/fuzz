@@ -45,8 +45,10 @@ if ! "$binary" --list | cut -f1 | grep -qx -- "$target"; then
     exit 2
 fi
 
+# Carries on only from a queue that holds inputs: a restored build cache can bring the folders back
+# without their files, and AFL++ will not start from an empty queue.
 findings="target/afl/findings/${target}"
-if [[ -d "${findings}/default/queue" ]]; then
+if compgen -G "${findings}/default/queue/id*" >/dev/null; then
     input=(-i -)
 else
     seeds="$(mktemp -d)"

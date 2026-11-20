@@ -158,11 +158,17 @@ pub fn run(data: &[u8]) {
     assert_eq!(shown(first.model()), shown(second.model()), "two writers ended on different documents");
     assert_eq!(shown(first.model()), shown(third.model()), "two writers ended on different documents");
     assert_eq!(shown(first.model()), reread(first.model()), "the document drifted from its history");
-    // A block two writers changed in the same words is settled as the later left it, and a note says so.
-    // Where no save had to do that, the file holds what the writers wrote and nothing else.
-    let settled = first.notes.notes.iter().any(|note| matches!(note.kind, NoteKind::Conflict { .. }));
-    if theirs && !settled {
-        assert_eq!(shown(first.model()), shown(&all), "saving lost or added something the writers did not write");
+    // A block two writers changed in the same words is settled as the later left it, in a step with no
+    // name to it, and with no note where the two read alike. Where no save had to do that once the folder
+    // was quiet, the file holds what the writers wrote and nothing else.
+    if theirs {
+        let mut ends = Model::load(&first.model().save(), 92.into()).expect("a saved history loads");
+        let settlings = ends.since(&all.revision()).expect("saving lost something a writer wrote");
+        assert!(settlings.iter().all(|step| step.authors.is_empty()), "a save wrote in a writer's name");
+        if settlings.is_empty() {
+            let told = "saving lost or added something the writers did not write";
+            assert_eq!(shown(first.model()), shown(&all), "{told}");
+        }
     }
     // Notes are compared as they are stored, since each writer ties them to its own history.
     let notes = first.notes.to_json();
