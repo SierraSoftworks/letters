@@ -73,6 +73,9 @@ jobs:
         run: |
           set -f
           mkdir -p fuzz-out
+          # Each night starts from the seeds: what the build cache kept of an earlier night's findings is
+          # no queue to carry on from.
+          rm -rf target/afl/findings
           targets="${FUZZ_TARGETS:-$(target/afl/fuzz/letters-fuzz --list | cut -f1)}"
           # One target to a core, each with its own log.
           printf '%s\n' $targets | xargs -P "$(nproc)" -I{} bash -c '
